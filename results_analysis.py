@@ -5,13 +5,11 @@ CSC 491/591 Ubiquitous Computing and Mobile Health
 =============================================================
 Generates all figures for Section 3 (Experiments & Analysis):
   1. Model comparison bar chart (Accuracy + Macro F1)
-  2. Combined confusion matrices (all 3 models)
+  2. Combined confusion matrices (all 4 models)
   3. Per-class F1 breakdown
   4. Per-subject accuracy comparison
   5. Feature distributions by emotional condition
   6. Classification report heatmaps
-
-Run AFTER step2b and step2c have saved their predictions.
 =============================================================
 """
 
@@ -25,49 +23,49 @@ import seaborn as sns
 from sklearn.metrics import (accuracy_score, f1_score,
                               confusion_matrix, classification_report)
 
-# ─────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────
 RESULTS_DIR   = "./results"
 PROCESSED_DIR = "./processed"
 OUTPUT_DIR    = "./results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-CLASS_NAMES   = ["Baseline", "Stress", "Amusement", "Meditation"]
-CLASS_COLORS  = ["#4C72B0", "#DD4949", "#55A868", "#8172B2"]
-MODEL_COLORS  = {"SVM": "#4C72B0", "RF": "#55A868", "CNN": "#DD8800"}
+CLASS_NAMES  = ["Baseline", "Stress", "Amusement", "Meditation"]
+CLASS_COLORS = ["#4C72B0", "#DD4949", "#55A868", "#8172B2"]
 
 
 def load_results():
-    """Load saved predictions from all three models."""
     svm_t = np.load(f"{RESULTS_DIR}/svm_true.npy")
     svm_p = np.load(f"{RESULTS_DIR}/svm_pred.npy")
     rf_t  = np.load(f"{RESULTS_DIR}/rf_true.npy")
     rf_p  = np.load(f"{RESULTS_DIR}/rf_pred.npy")
+    xgb_t = np.load(f"{RESULTS_DIR}/xgb_true.npy")
+    xgb_p = np.load(f"{RESULTS_DIR}/xgb_pred.npy")
     cnn_t = np.load(f"{RESULTS_DIR}/cnn_true.npy")
     cnn_p = np.load(f"{RESULTS_DIR}/cnn_pred.npy")
-    return svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p
+    return svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p
 
 
 # ─────────────────────────────────────────────
 # FIG 1: Model Comparison Bar Chart
 # ─────────────────────────────────────────────
 
-def plot_model_comparison(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
+def plot_model_comparison(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p):
     model_labels = [
         "SVM\n(Feature-Based)",
         "Random Forest\n(Feature-Based)",
-        "1D CNN\n(End-to-End)"
+        "XGBoost\n(Feature-Based)",
+        "1D CNN\n(End-to-End)",
     ]
     accs = [accuracy_score(svm_t, svm_p),
             accuracy_score(rf_t,  rf_p),
+            accuracy_score(xgb_t, xgb_p),
             accuracy_score(cnn_t, cnn_p)]
     f1s  = [f1_score(svm_t, svm_p, average='macro'),
             f1_score(rf_t,  rf_p,  average='macro'),
+            f1_score(xgb_t, xgb_p, average='macro'),
             f1_score(cnn_t, cnn_p, average='macro')]
-    colors = ["#4C72B0", "#55A868", "#DD8800"]
+    colors = ["#4C72B0", "#55A868", "#E69F00", "#DD8800"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
     fig.suptitle(
         "Model Comparison — Leave-One-Subject-Out Cross-Validation\n"
         "WESAD Dataset  |  N=15 subjects  |  2,942 windows",
@@ -80,13 +78,13 @@ def plot_model_comparison(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
             ax.text(bar.get_x() + bar.get_width()/2,
                     bar.get_height() + 0.008,
                     f"{v:.3f}", ha='center', va='bottom',
-                    fontsize=13, fontweight='bold')
+                    fontsize=12, fontweight='bold')
         ax.set_ylim(0, 1.05)
         ax.set_ylabel(metric, fontsize=11)
         ax.set_title(metric, fontsize=12, fontweight='bold')
         ax.axhline(0.25, color='gray', linestyle='--', alpha=0.5,
                    linewidth=1.2, label='Chance (25%)')
-        ax.text(2.38, 0.265, "chance\n(25%)", color='gray', fontsize=8)
+        ax.text(3.38, 0.265, "chance\n(25%)", color='gray', fontsize=8)
         ax.spines[['top', 'right']].set_visible(False)
 
     plt.tight_layout()
@@ -97,23 +95,24 @@ def plot_model_comparison(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
 
 
 # ─────────────────────────────────────────────
-# FIG 2: Combined Confusion Matrices
+# FIG 2: Combined Confusion Matrices (2x2)
 # ─────────────────────────────────────────────
 
-def plot_confusion_matrices(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
+def plot_confusion_matrices(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p):
     results = [
-        ("SVM\n(Feature-Based)",       svm_t, svm_p, "#4C72B0"),
-        ("Random Forest\n(Feature-Based)", rf_t, rf_p, "#55A868"),
-        ("1D CNN\n(End-to-End)",        cnn_t, cnn_p, "#DD8800"),
+        ("SVM (Feature-Based)",           svm_t, svm_p, "#4C72B0"),
+        ("Random Forest (Feature-Based)", rf_t,  rf_p,  "#55A868"),
+        ("XGBoost (Feature-Based)",       xgb_t, xgb_p, "#E69F00"),
+        ("1D CNN (End-to-End)",           cnn_t, cnn_p, "#DD8800"),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
     fig.suptitle(
         "Confusion Matrices — LOSO Cross-Validation  (N=15 subjects)",
-        fontsize=14, fontweight='bold', y=1.02
+        fontsize=14, fontweight='bold', y=1.01
     )
 
-    for ax, (name, yt, yp, col) in zip(axes, results):
+    for ax, (name, yt, yp, col) in zip(axes.flat, results):
         cm      = confusion_matrix(yt, yp)
         cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
         sns.heatmap(
@@ -142,23 +141,24 @@ def plot_confusion_matrices(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
 
 
 # ─────────────────────────────────────────────
-# FIG 3: Per-Class F1 Score
+# FIG 3: Per-Class F1 Score (2x2)
 # ─────────────────────────────────────────────
 
-def plot_per_class_f1(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
+def plot_per_class_f1(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p):
     results = [
-        ("SVM (Feature-Based)",        svm_t, svm_p, "#4C72B0"),
-        ("Random Forest (Feature-Based)", rf_t, rf_p, "#55A868"),
-        ("1D CNN (End-to-End)",         cnn_t, cnn_p, "#DD8800"),
+        ("SVM (Feature-Based)",           svm_t, svm_p, "#4C72B0"),
+        ("Random Forest (Feature-Based)", rf_t,  rf_p,  "#55A868"),
+        ("XGBoost (Feature-Based)",       xgb_t, xgb_p, "#E69F00"),
+        ("1D CNN (End-to-End)",           cnn_t, cnn_p, "#DD8800"),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     fig.suptitle("Per-Class F1 Score by Model", fontsize=13, fontweight='bold')
 
-    for ax, (name, yt, yp, col) in zip(axes, results):
+    for ax, (name, yt, yp, col) in zip(axes.flat, results):
         f1_per = f1_score(yt, yp, average=None)
         bars   = ax.bar(CLASS_NAMES, f1_per, color=CLASS_COLORS,
-                         edgecolor='white', width=0.55)
+                        edgecolor='white', width=0.55)
         for bar, v in zip(bars, f1_per):
             ax.text(bar.get_x() + bar.get_width()/2,
                     bar.get_height() + 0.012,
@@ -191,14 +191,16 @@ def plot_per_subject_accuracy():
 
     svm_accs = [cl["svm"]["per_subject"][s]["acc"] for s in subjects]
     rf_accs  = [cl["rf"]["per_subject"][s]["acc"]  for s in subjects]
+    xgb_accs = [cl["xgb"]["per_subject"][s]["acc"] for s in subjects]
     cnn_accs = [cnn["per_subject"].get(s, {}).get("acc", 0) for s in subjects]
 
-    x = np.arange(len(subjects)); w = 0.26
-    fig, ax = plt.subplots(figsize=(14, 4.5))
+    x = np.arange(len(subjects)); w = 0.20
+    fig, ax = plt.subplots(figsize=(15, 5))
 
-    ax.bar(x - w,   svm_accs, w, label='SVM',          color='#4C72B0', edgecolor='white')
-    ax.bar(x,       rf_accs,  w, label='Random Forest', color='#55A868', edgecolor='white')
-    ax.bar(x + w,   cnn_accs, w, label='1D CNN',        color='#DD8800', edgecolor='white')
+    ax.bar(x - 1.5*w, svm_accs, w, label='SVM',          color='#4C72B0', edgecolor='white')
+    ax.bar(x - 0.5*w, rf_accs,  w, label='Random Forest', color='#55A868', edgecolor='white')
+    ax.bar(x + 0.5*w, xgb_accs, w, label='XGBoost',       color='#E69F00', edgecolor='white')
+    ax.bar(x + 1.5*w, cnn_accs, w, label='1D CNN',         color='#DD8800', edgecolor='white')
     ax.axhline(0.25, color='gray', linestyle='--', alpha=0.6,
                linewidth=1.2, label='Chance (25%)')
 
@@ -238,10 +240,11 @@ def plot_feature_distributions():
     for ax, feat, flabel in zip(axes.flat, key_feats, key_labels):
         fidx = feat_names.index(feat)
         for ci, cname in enumerate(CLASS_NAMES):
-            vals = X[y == ci, fidx]
-            ax.hist(vals, bins=35, alpha=0.55,
-                    label=cname, color=CLASS_COLORS[ci],
-                    edgecolor='none', density=True)
+            vals = X[y == (ci + 1), fidx]  # labels are 1-4
+            if len(vals) > 0:
+                ax.hist(vals, bins=35, alpha=0.55,
+                        label=cname, color=CLASS_COLORS[ci],
+                        edgecolor='none', density=True)
         ax.set_xlabel(flabel, fontsize=11)
         ax.set_ylabel("Density",  fontsize=10)
         ax.set_title(flabel,      fontsize=11, fontweight='bold')
@@ -256,22 +259,23 @@ def plot_feature_distributions():
 
 
 # ─────────────────────────────────────────────
-# FIG 6: Classification Report Heatmaps
+# FIG 6: Classification Report Heatmaps (2x2)
 # ─────────────────────────────────────────────
 
-def plot_classification_report_heatmaps(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
+def plot_classification_report_heatmaps(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p):
     results = [
-        ("SVM (Feature-Based)",        svm_t, svm_p, "#4C72B0"),
-        ("Random Forest (Feature-Based)", rf_t, rf_p, "#55A868"),
-        ("1D CNN (End-to-End)",         cnn_t, cnn_p, "#DD8800"),
+        ("SVM (Feature-Based)",           svm_t, svm_p, "#4C72B0"),
+        ("Random Forest (Feature-Based)", rf_t,  rf_p,  "#55A868"),
+        ("XGBoost (Feature-Based)",       xgb_t, xgb_p, "#E69F00"),
+        ("1D CNN (End-to-End)",           cnn_t, cnn_p, "#DD8800"),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle("Detailed Classification Report — All Models (LOSO)",
                  fontsize=13, fontweight='bold')
 
-    for ax, (name, yt, yp, col) in zip(axes, results):
-        report = classification_report(yt, yp, target_names=CLASS_NAMES,
+    for ax, (name, yt, yp, col) in zip(axes.flat, results):
+        report  = classification_report(yt, yp, target_names=CLASS_NAMES,
                                         output_dict=True)
         metrics = ['precision', 'recall', 'f1-score']
         data    = np.array([[report[c][m] for m in metrics] for c in CLASS_NAMES])
@@ -310,44 +314,39 @@ def plot_classification_report_heatmaps(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
 # PRINT FULL SUMMARY TABLE
 # ─────────────────────────────────────────────
 
-def print_summary(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p):
-    print("\n" + "=" * 60)
+def print_summary(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p):
+    print("\n" + "=" * 65)
     print("  SECTION 3 — FULL RESULTS SUMMARY")
-    print("=" * 60)
+    print("=" * 65)
 
     results = [
-        ("SVM (Feature-Based)",        svm_t, svm_p),
-        ("Random Forest (Feature-Based)", rf_t, rf_p),
-        ("1D CNN (End-to-End)",         cnn_t, cnn_p),
+        ("SVM (Feature-Based)",           svm_t, svm_p),
+        ("Random Forest (Feature-Based)", rf_t,  rf_p),
+        ("XGBoost (Feature-Based)",       xgb_t, xgb_p),
+        ("1D CNN (End-to-End)",           cnn_t, cnn_p),
     ]
 
-    print(f"\n  {'Model':<30} {'Accuracy':>10} {'Macro F1':>10}")
-    print(f"  {'-'*52}")
+    print(f"\n  {'Model':<35} {'Accuracy':>10} {'Macro F1':>10}")
+    print(f"  {'-'*57}")
     for name, yt, yp in results:
-        print(f"  {name:<30} "
+        print(f"  {name:<35} "
               f"{accuracy_score(yt,yp):>10.4f} "
               f"{f1_score(yt,yp,average='macro'):>10.4f}")
 
     print(f"\n  Per-class F1:")
-    print(f"  {'Class':<14}", end="")
+    header = f"  {'Class':<14}"
     for name, _, __ in results:
-        print(f"  {name.split('(')[0].strip():>14}", end="")
-    print()
+        header += f"  {name.split('(')[0].strip():>14}"
+    print(header)
 
     for ci, cname in enumerate(CLASS_NAMES):
-        print(f"  {cname:<14}", end="")
+        row = f"  {cname:<14}"
         for _, yt, yp in results:
             f1c = f1_score(yt, yp, average=None)[ci]
-            print(f"  {f1c:>14.3f}", end="")
-        print()
+            row += f"  {f1c:>14.3f}"
+        print(row)
 
-    print("\n  Insights:")
-    print("  • All models exceed chance (25%) — PPG encodes emotion-relevant info")
-    print("  • Amusement is the hardest class (fewest samples + subtle physiology)")
-    print("  • SVM achieves highest Macro F1 due to balanced class handling")
-    print("  • Feature-based models outperform raw-signal MLP (convolutions needed)")
-    print("  • High inter-subject variance limits overall performance")
-    print("=" * 60)
+    print("=" * 65)
 
 
 # ─────────────────────────────────────────────
@@ -359,17 +358,17 @@ def main():
     print("  WESAD Results Analysis — Section 3")
     print("=" * 60)
 
-    svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p = load_results()
+    svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p = load_results()
 
     print("\n  Generating figures...")
-    plot_model_comparison(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p)
-    plot_confusion_matrices(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p)
-    plot_per_class_f1(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p)
+    plot_model_comparison(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p)
+    plot_confusion_matrices(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p)
+    plot_per_class_f1(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p)
     plot_per_subject_accuracy()
     plot_feature_distributions()
-    plot_classification_report_heatmaps(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p)
+    plot_classification_report_heatmaps(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p)
 
-    print_summary(svm_t, svm_p, rf_t, rf_p, cnn_t, cnn_p)
+    print_summary(svm_t, svm_p, rf_t, rf_p, xgb_t, xgb_p, cnn_t, cnn_p)
     print(f"\n  All figures saved to: {OUTPUT_DIR}/")
 
 

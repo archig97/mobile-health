@@ -36,6 +36,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, f1_score,
                               confusion_matrix, classification_report)
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from xgboost import XGBClassifier
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -65,6 +67,20 @@ def make_svm():
         gamma='scale',
         class_weight='balanced',
         random_state=42
+    )
+
+
+def make_xgboost():
+    return XGBClassifier(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+        eval_metric='mlogloss',
+        random_state=42,
+        n_jobs=-1
     )
 
 
@@ -121,6 +137,15 @@ def loso_cv(X, y, subjects, make_clf, clf_name, verbose=True):
         scaler   = StandardScaler()
         X_train  = scaler.fit_transform(X_train)
         X_test   = scaler.transform(X_test)
+
+        # Oversample minority classes in training fold only (never touch test)
+        min_class_count = int(np.bincount(y_train)[np.unique(y_train)].min())
+        try:
+            smote   = SMOTE(random_state=42, k_neighbors=min(5, min_class_count - 1))
+            X_train, y_train = smote.fit_resample(X_train, y_train)
+        except ValueError:
+            ros     = RandomOverSampler(random_state=42)
+            X_train, y_train = ros.fit_resample(X_train, y_train)
 
         # Train and predict
         clf   = make_clf()
@@ -223,7 +248,7 @@ def main():
         feat_names = json.load(f)
 
     print(f"\n  Features: {X.shape}  (windows × features)")
-    print(f"  Labels  : {np.unique(y)} → {[CLASS_NAMES[i] for i in np.unique(y)]}")
+    print(f"  Labels  : {np.unique(y)} → {[LABEL_NAMES[i] for i in np.unique(y)]}")
     print(f"  Subjects: {sorted(np.unique(subj))}")
 
     # ── SVM ──
@@ -245,6 +270,17 @@ def main():
         f"Random Forest — Confusion Matrix (LOSO)\nAcc={accuracy_score(rf_true,rf_pred):.3f}  "
         f"Macro F1={f1_score(rf_true,rf_pred,average='macro'):.3f}",
         f"{OUTPUT_DIR}/cm_rf.png")
+
+    # ── XGBoost ── (requires 0-indexed labels)
+    y_xgb = y - 1
+    xgb_true, xgb_pred, xgb_subj = loso_cv(
+        X, y_xgb, subj, make_xgboost, "XGBoost (200 trees)")
+    print_report("XGBoost", xgb_true, xgb_pred)
+    plot_confusion_matrix(
+        xgb_true, xgb_pred,
+        f"XGBoost — Confusion Matrix (LOSO)\nAcc={accuracy_score(xgb_true,xgb_pred):.3f}  "
+        f"Macro F1={f1_score(xgb_true,xgb_pred,average='macro'):.3f}",
+        f"{OUTPUT_DIR}/cm_xgb.png")
 
     # Feature importance (train on ALL data for visualization only)
     print("\n  Computing feature importance (full dataset)...")
@@ -282,6 +318,8 @@ def main():
     np.save(f"{OUTPUT_DIR}/svm_pred.npy", svm_pred)
     np.save(f"{OUTPUT_DIR}/rf_true.npy",  rf_true)
     np.save(f"{OUTPUT_DIR}/rf_pred.npy",  rf_pred)
+    np.save(f"{OUTPUT_DIR}/xgb_true.npy", xgb_true)
+    np.save(f"{OUTPUT_DIR}/xgb_pred.npy", xgb_pred)
 
     with open(f"{OUTPUT_DIR}/classical_results.json", "w") as f:
         # Convert non-serializable types
@@ -296,6 +334,11 @@ def main():
                     "per_class_f1": results["rf"]["per_class_f1"],
                     "per_subject": {k: {"acc": v["acc"], "f1": v["f1"]}
                                     for k, v in rf_subj.items()}},
+            "xgb": {"accuracy": float(accuracy_score(xgb_true, xgb_pred)),
+                    "macro_f1": float(f1_score(xgb_true, xgb_pred, average='macro')),
+                    "per_class_f1": f1_score(xgb_true, xgb_pred, average=None).tolist(),
+                    "per_subject": {k: {"acc": v["acc"], "f1": v["f1"]}
+                                    for k, v in xgb_subj.items()}},
         }
         json.dump(r, f, indent=2)
 
@@ -310,6 +353,9 @@ def main():
     print(f"  {'Random Forest (Feature)':<25} "
           f"{accuracy_score(rf_true,rf_pred):>10.4f} "
           f"{f1_score(rf_true,rf_pred,average='macro'):>10.4f}")
+    print(f"  {'XGBoost (Feature)':<25} "
+          f"{accuracy_score(xgb_true,xgb_pred):>10.4f} "
+          f"{f1_score(xgb_true,xgb_pred,average='macro'):>10.4f}")
     print("=" * 60)
 
 

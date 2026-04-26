@@ -63,10 +63,10 @@ FS           = 64
 WIN_SAMPLES  = 1920   # 30s × 64 Hz
 
 # Training hyperparameters
-EPOCHS       = 30
-BATCH_SIZE   = 32
+EPOCHS       = 50
+BATCH_SIZE   = 64
 VAL_SPLIT    = 0.10
-PATIENCE     = 5      # EarlyStopping patience
+PATIENCE     = 10     # EarlyStopping patience
 
 # ─────────────────────────────────────────────
 # MODEL ARCHITECTURE
@@ -180,13 +180,21 @@ def loso_cnn(X, y, subjects, verbose=True):
             verbose=0
         )
 
+        reduce_lr = callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=4,
+            min_lr=1e-5,
+            verbose=0
+        )
+
         model.fit(
             X_train, y_train,
             validation_split=VAL_SPLIT,
             epochs=EPOCHS,
             batch_size=BATCH_SIZE,
             class_weight=cw_dict,
-            callbacks=[early_stop],
+            callbacks=[early_stop, reduce_lr],
             verbose=0
         )
 
