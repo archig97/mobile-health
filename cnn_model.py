@@ -1,362 +1,1313 @@
-"""
-=============================================================
-WESAD Course Project — Step 2c: 1D CNN (End-to-End)
-CSC 491/591 Ubiquitous Computing and Mobile Health
-=============================================================
-Approach 1 (End-to-End):
-  Raw PPG windows fed directly into a 1D CNN.
-  The network learns its own feature representations
-  from the raw waveform without hand-crafted features.
-
-Architecture:
-  Input      (1920 × 1)  — 30s @ 64 Hz
-  Conv1D(32, k=7) + BN + ReLU + MaxPool(4)  → (480 × 32)
-  Conv1D(64, k=5) + BN + ReLU + MaxPool(4)  → (120 × 64)
-  Conv1D(128,k=3) + BN + ReLU + GlobalAvgPool → (128,)
-  Dense(64) + Dropout(0.4)
-  Dense(4)  + Softmax  → class probabilities
-
-Design rationale:
-  - Hierarchical Conv1D blocks extract features at different temporal scales
-    (k=7 captures ~110ms, k=5 captures ~78ms, k=3 captures ~47ms)
-  - BatchNorm stabilizes training across subjects with different physiology
-  - GlobalAveragePooling reduces parameters vs Flatten (less overfitting)
-  - Dropout(0.4) prevents overfitting given limited subject count
-  - class_weight='balanced' handles Amusement underrepresentation
-  - EarlyStopping(patience=5) prevents overfitting to training subjects
-
-Evaluation: LOSO Cross-Validation (same protocol as classical models)
-
-Requirements: tensorflow >= 2.x  OR  keras
-=============================================================
-"""
-
-import os
-import json
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-from sklearn.metrics import (accuracy_score, f1_score,
-                              confusion_matrix, classification_report)
-from sklearn.utils.class_weight import compute_class_weight
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
-from tensorflow.keras import layers, models, callbacks
-
-# ─────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────
-PROCESSED_DIR = "./processed"
-OUTPUT_DIR    = "./results"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-CLASS_NAMES  = ["Baseline", "Stress", "Amusement", "Meditation"]
-N_CLASSES    = 4
-FS           = 64
-WIN_SAMPLES  = 1920   # 30s × 64 Hz
-
-# Training hyperparameters
-EPOCHS       = 50
-BATCH_SIZE   = 64
-VAL_SPLIT    = 0.10
-PATIENCE     = 10     # EarlyStopping patience
-
-# ─────────────────────────────────────────────
-# MODEL ARCHITECTURE
-# ─────────────────────────────────────────────
-
-def build_cnn(input_len=WIN_SAMPLES, n_classes=N_CLASSES):
-    """
-    1D CNN for PPG emotion classification.
-
-    Layer-by-layer breakdown:
-      Input:              (batch, 1920, 1)
-      Conv1D(32, k=7):    learns low-level wave features (~110ms receptive field)
-      BatchNorm + ReLU:   normalize + nonlinearity
-      MaxPool(4):         downsample (batch, 480, 32)
-      Conv1D(64, k=5):    mid-level features (combined beat shape)
-      BatchNorm + ReLU
-      MaxPool(4):         (batch, 120, 64)
-      Conv1D(128, k=3):   high-level features (HRV patterns)
-      BatchNorm + ReLU
-      GlobalAvgPool:      (batch, 128) — channel-wise averaging, position-invariant
-      Dense(64) + ReLU:   learned combination of CNN features
-      Dropout(0.4):       regularization
-      Dense(4) + Softmax: class probabilities
-    """
-    inp = layers.Input(shape=(input_len, 1), name="ppg_input")
-
-    # Block 1 — low-level features
-    x = layers.Conv1D(32, kernel_size=7, padding='same', name='conv1')(inp)
-    x = layers.BatchNormalization(name='bn1')(x)
-    x = layers.ReLU(name='relu1')(x)
-    x = layers.MaxPooling1D(4, name='pool1')(x)
-
-    # Block 2 — mid-level features
-    x = layers.Conv1D(64, kernel_size=5, padding='same', name='conv2')(x)
-    x = layers.BatchNormalization(name='bn2')(x)
-    x = layers.ReLU(name='relu2')(x)
-    x = layers.MaxPooling1D(4, name='pool2')(x)
-
-    # Block 3 — high-level features
-    x = layers.Conv1D(128, kernel_size=3, padding='same', name='conv3')(x)
-    x = layers.BatchNormalization(name='bn3')(x)
-    x = layers.ReLU(name='relu3')(x)
-    x = layers.GlobalAveragePooling1D(name='gap')(x)
-
-    # Classifier head
-    x   = layers.Dense(64, activation='relu', name='dense1')(x)
-    x   = layers.Dropout(0.4, name='dropout')(x)
-    out = layers.Dense(n_classes, activation='softmax', name='output')(x)
-
-    model = models.Model(inp, out, name="1D_CNN_PPG")
-    model.compile(
-        optimizer='adam',
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    return model
-
-
-def preprocess_cnn_input(segments):
-    """
-    Per-window z-score normalization.
-    Removes absolute amplitude differences between subjects
-    (different skin tones, sensor contact → different PPG amplitudes).
-    """
-    X = segments.copy().astype(np.float32)
-    mu  = X.mean(axis=1, keepdims=True)
-    std = X.std(axis=1,  keepdims=True) + 1e-8
-    X   = (X - mu) / std
-    return X[..., np.newaxis]   # (N, 1920, 1)
-
-
-# ─────────────────────────────────────────────
-# LOSO CROSS-VALIDATION
-# ─────────────────────────────────────────────
-
-def loso_cnn(X, y, subjects, verbose=True):
-    """
-    Leave-One-Subject-Out CV for the 1D CNN.
-    A fresh model is created and trained for each fold.
-    """
-    unique_subjects = sorted(np.unique(subjects))
-    all_true, all_pred = [], []
-    per_subj_results   = {}
-
-    if verbose:
-        print(f"\n  1D CNN — LOSO ({len(unique_subjects)} folds)")
-        print(f"  Epochs: {EPOCHS}, Batch: {BATCH_SIZE}, EarlyStop patience: {PATIENCE}")
-        print(f"  {'Subject':<8} {'N_test':>7} {'Acc':>7} {'Macro F1':>10}")
-        print(f"  {'-'*36}")
-
-    for fold_i, test_subj in enumerate(unique_subjects):
-        train_mask = subjects != test_subj
-        test_mask  = subjects == test_subj
-
-        X_train, y_train = X[train_mask], y[train_mask]
-        X_test,  y_test  = X[test_mask],  y[test_mask]
-
-        # Class weights for this fold's training set
-        cw_vals = compute_class_weight('balanced',
-                                        classes=np.unique(y_train),
-                                        y=y_train)
-        cw_dict = dict(enumerate(cw_vals))
-
-        # Fresh model each fold
-        model = build_cnn(input_len=X.shape[1], n_classes=N_CLASSES)
-
-        early_stop = callbacks.EarlyStopping(
-            monitor='val_loss',
-            patience=PATIENCE,
-            restore_best_weights=True,
-            verbose=0
-        )
-
-        reduce_lr = callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=4,
-            min_lr=1e-5,
-            verbose=0
-        )
-
-        model.fit(
-            X_train, y_train,
-            validation_split=VAL_SPLIT,
-            epochs=EPOCHS,
-            batch_size=BATCH_SIZE,
-            class_weight=cw_dict,
-            callbacks=[early_stop, reduce_lr],
-            verbose=0
-        )
-
-        preds = np.argmax(model.predict(X_test, verbose=0), axis=1)
-        all_true.extend(y_test)
-        all_pred.extend(preds)
-
-        acc = accuracy_score(y_test, preds)
-        f1  = f1_score(y_test, preds, average='macro')
-        per_subj_results[test_subj] = {'acc': acc, 'f1': f1, 'n': int(test_mask.sum())}
-
-        if verbose:
-            print(f"  {test_subj:<8} {test_mask.sum():>7} {acc:>7.3f} {f1:>10.3f}")
-
-        tf.keras.backend.clear_session()   # free GPU/CPU memory
-
-    all_true = np.array(all_true)
-    all_pred = np.array(all_pred)
-
-    overall_acc = accuracy_score(all_true, all_pred)
-    overall_f1  = f1_score(all_true, all_pred, average='macro')
-
-    if verbose:
-        print(f"  {'-'*36}")
-        print(f"  {'OVERALL':<8} {len(all_true):>7} "
-              f"{overall_acc:>7.3f} {overall_f1:>10.3f}")
-
-    return all_true, all_pred, per_subj_results
-
-
-# ─────────────────────────────────────────────
-# ARCHITECTURE DIAGRAM
-# ─────────────────────────────────────────────
-
-def plot_architecture(filepath):
-    """Render a visual diagram of the CNN architecture."""
-    fig, ax = plt.subplots(figsize=(15, 4.5))
-    ax.set_facecolor('#F8F9FA'); fig.patch.set_facecolor('#F8F9FA')
-    ax.axis('off')
-
-    arch = [
-        ("Input\n1920 × 1\n30s PPG\n@ 64 Hz",   "#6C757D"),
-        ("Conv1D(32)\nkernel=7\nBN + ReLU\nMaxPool(4)\n→ 480×32", "#1C7293"),
-        ("Conv1D(64)\nkernel=5\nBN + ReLU\nMaxPool(4)\n→ 120×64", "#1C7293"),
-        ("Conv1D(128)\nkernel=3\nBN + ReLU\nGlobalAvg\n→ 128",    "#065A82"),
-        ("Dense(64)\nReLU\nDropout\n(0.4)",       "#028090"),
-        ("Dense(4)\nSoftmax\n→ 4 classes",         "#DD4949"),
-    ]
-
-    n = len(arch)
-    w = 0.132; gap = 0.012
-
-    for i, (label, color) in enumerate(arch):
-        x0 = i * (w + gap) + 0.01
-        rect = plt.Rectangle((x0, 0.10), w, 0.80,
-                               transform=ax.transAxes, color=color,
-                               clip_on=False, zorder=2, linewidth=0, alpha=0.92)
-        ax.add_patch(rect)
-        ax.text(x0 + w/2, 0.50, label,
-                transform=ax.transAxes, ha='center', va='center',
-                fontsize=9, fontweight='bold', color='white',
-                zorder=3, multialignment='center', linespacing=1.4)
-        if i < n - 1:
-            x_start = x0 + w + 0.003
-            x_end   = x0 + w + gap - 0.003
-            ax.annotate('',
-                        xy=(x_end, 0.50), xytext=(x_start, 0.50),
-                        xycoords='axes fraction', textcoords='axes fraction',
-                        arrowprops=dict(arrowstyle='-|>',
-                                        color='#333333', lw=2.0,
-                                        mutation_scale=15))
-
-    ax.set_title("1D CNN Architecture — End-to-End PPG Emotion Recognition",
-                 fontsize=13, fontweight='bold', pad=18, color='#212529')
-    plt.tight_layout()
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {filepath}")
-
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
-def main():
-    print("=" * 60)
-    print("  WESAD 1D CNN — LOSO Cross-Validation")
-    print("=" * 60)
-
-    segments = np.load(f"{PROCESSED_DIR}/all_segments.npy")
-    labels   = np.load(f"{PROCESSED_DIR}/all_labels.npy")
-    subjects = np.load(f"{PROCESSED_DIR}/all_subjects.npy")
-
-    # Map labels 1–4 → 0–3 for Keras
-    label_map  = {1: 0, 2: 1, 3: 2, 4: 3}
-    labels_enc = np.array([label_map[l] for l in labels])
-
-    print(f"\n  Loaded   : {segments.shape[0]:,} windows, shape {segments.shape}")
-    print(f"  Subjects : {sorted(np.unique(subjects))}")
-
-    # Preprocess
-    X = preprocess_cnn_input(segments)
-    print(f"  CNN input: {X.shape}  (normalized, channel dim added)")
-
-    # Print model summary once
-    model_demo = build_cnn()
-    model_demo.summary()
-    tf.keras.backend.clear_session()
-
-    # Architecture diagram
-    plot_architecture(f"{OUTPUT_DIR}/cnn_architecture.png")
-
-    # LOSO
-    cnn_true, cnn_pred, cnn_subj = loso_cnn(X, labels_enc, subjects)
-
-    # Report
-    print(f"\n{'='*50}")
-    print(f"  1D CNN — Classification Report")
-    print(f"{'='*50}")
-    print(classification_report(cnn_true, cnn_pred,
-                                 target_names=CLASS_NAMES, digits=3))
-
-    # Confusion matrix
-    cm      = confusion_matrix(cnn_true, cnn_pred)
-    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-    fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    sns.heatmap(cm_norm, annot=cm, fmt='d', cmap='Blues',
-                xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
-                linewidths=0.5, linecolor='white',
-                cbar_kws={'label': 'Row Proportion', 'shrink': 0.85}, ax=ax)
-    ax.set_xlabel("Predicted", fontsize=11, fontweight='bold')
-    ax.set_ylabel("True",      fontsize=11, fontweight='bold')
-    ax.set_title(
-        f"1D CNN — Confusion Matrix (LOSO)\n"
-        f"Acc={accuracy_score(cnn_true,cnn_pred):.3f}  "
-        f"Macro F1={f1_score(cnn_true,cnn_pred,average='macro'):.3f}",
-        fontsize=11, fontweight='bold')
-    ax.tick_params(axis='x', rotation=30); ax.tick_params(axis='y', rotation=0)
-    plt.tight_layout()
-    cm_path = f"{OUTPUT_DIR}/cm_cnn.png"
-    plt.savefig(cm_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: {cm_path}")
-
-    # Save
-    np.save(f"{OUTPUT_DIR}/cnn_true.npy", cnn_true)
-    np.save(f"{OUTPUT_DIR}/cnn_pred.npy", cnn_pred)
-
-    cnn_results = {
-        "accuracy":     float(accuracy_score(cnn_true, cnn_pred)),
-        "macro_f1":     float(f1_score(cnn_true, cnn_pred, average='macro')),
-        "per_class_f1": f1_score(cnn_true, cnn_pred, average=None).tolist(),
-        "per_subject":  {k: {"acc": v["acc"], "f1": v["f1"]}
-                         for k, v in cnn_subj.items()},
-    }
-    with open(f"{OUTPUT_DIR}/cnn_results.json", "w") as f:
-        json.dump(cnn_results, f, indent=2)
-
-    print(f"\n  Results saved to {OUTPUT_DIR}/")
-    print(f"  CNN Accuracy : {cnn_results['accuracy']:.4f}")
-    print(f"  CNN Macro F1 : {cnn_results['macro_f1']:.4f}")
-
-
-if __name__ == "__main__":
-    main()
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Emotion Recognition from Photoplethysmography (PPG) Signals\n",
+    "## CSC 491/591 — Ubiquitous Computing and Mobile Health\n",
+    "\n",
+    "**Dataset**: WESAD (Wearable Stress and Affect Detection)  \n",
+    "**Goal**: Classify emotional states (Baseline, Stress, Amusement) from wrist PPG (BVP) signals  \n",
+    "**Reference**: Schmidt et al. (WESAD, ICMI 2018); Rashid et al. (H-CNN, EMBC 2021)\n",
+    "\n",
+    "---"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Setup"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "%matplotlib inline\n",
+    "import os\n",
+    "import gc\n",
+    "import pickle\n",
+    "import warnings\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import matplotlib.gridspec as gridspec\n",
+    "from pathlib import Path\n",
+    "from scipy import signal as sp_signal\n",
+    "from scipy.signal import find_peaks, welch\n",
+    "from scipy.stats import skew, kurtosis\n",
+    "from sklearn.svm import SVC\n",
+    "from sklearn.ensemble import RandomForestClassifier\n",
+    "from sklearn.preprocessing import StandardScaler\n",
+    "from sklearn.metrics import (accuracy_score, f1_score, confusion_matrix,\n",
+    "                             ConfusionMatrixDisplay, classification_report)\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "from torch.utils.data import DataLoader, TensorDataset\n",
+    "\n",
+    "warnings.filterwarnings('ignore')\n",
+    "np.random.seed(42)\n",
+    "torch.manual_seed(42)\n",
+    "\n",
+    "# ── Paths ──────────────────────────────────────────────────────────────────\n",
+    "WESAD_ROOT = Path(r'e:/NCSU/Sem 4/course_project/WESAD/WESAD')\n",
+    "SUBJECTS   = ['S2','S3','S4','S5','S6','S7','S8','S9','S10','S11','S13','S14','S15','S16','S17']\n",
+    "\n",
+    "# ── Signal constants ───────────────────────────────────────────────────────\n",
+    "BVP_FS       = 64           # wrist BVP sampling rate (Hz)\n",
+    "LABEL_FS     = 700          # chest/label sampling rate (Hz)\n",
+    "\n",
+    "# CHANGED: 60s window + 5s step — matches both WESAD and H-CNN papers exactly.\n",
+    "# At 8s, the LF band (0.04 Hz, period=25s) cannot be observed → LF/HF features\n",
+    "# were invalid. The H-CNN paper: \"segmented by a window of 60 seconds ... sliding\n",
+    "# length of 5 seconds\". WESAD paper: \"window size of 60 seconds following Kreibig\n",
+    "# et al. (2010)\".\n",
+    "WIN_SEC      = 60           # window length in seconds\n",
+    "STEP_SEC     = 5            # window step in seconds\n",
+    "WIN_SAMPLES  = int(WIN_SEC  * BVP_FS)   # 3840 — matches H-CNN paper\n",
+    "STEP_SAMPLES = int(STEP_SEC * BVP_FS)   # 320\n",
+    "\n",
+    "# CHANGED: Dropped Meditation (label 4). Neither reference paper evaluates it.\n",
+    "# Using only {1,2,3} enables fair comparison against published benchmarks.\n",
+    "LABEL_MAP    = {1: 'Baseline', 2: 'Stress', 3: 'Amusement'}\n",
+    "VALID_LABELS = set(LABEL_MAP.keys())\n",
+    "\n",
+    "DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+    "print(f'Using device: {DEVICE}')\n",
+    "print(f'Window size:  {WIN_SAMPLES} samples ({WIN_SEC}s) | Step: {STEP_SAMPLES} samples ({STEP_SEC}s)')\n",
+    "print(f'Classes:      {list(LABEL_MAP.values())}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "# Section 1: Data Processing (60 pts)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1.1 Data Loading\n",
+    "\n",
+    "Each subject's `SX.pkl` file contains a dictionary with two top-level keys:\n",
+    "- `signal` → `wrist` → `BVP`: the raw PPG signal at **64 Hz**\n",
+    "- `label`: emotion condition labels at **700 Hz** (same rate as chest sensors)\n",
+    "\n",
+    "We extract only the wrist BVP and the corresponding labels, aligning them by downsampling the label array to the BVP rate."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def load_subject(subject_id: str):\n",
+    "    \"\"\"Load BVP signal and labels for one subject.\n",
+    "\n",
+    "    Returns\n",
+    "    -------\n",
+    "    bvp    : np.ndarray, shape (N,)  — raw PPG signal at BVP_FS Hz\n",
+    "    labels : np.ndarray, shape (N,)  — per-sample emotion label at BVP_FS Hz\n",
+    "    \"\"\"\n",
+    "    pkl_path = WESAD_ROOT / subject_id / f'{subject_id}.pkl'\n",
+    "    with open(pkl_path, 'rb') as f:\n",
+    "        data = pickle.load(f, encoding='latin1')\n",
+    "\n",
+    "    bvp         = data['signal']['wrist']['BVP'].flatten()   # (N,)\n",
+    "    labels_full = data['label']                               # (M,) at LABEL_FS\n",
+    "\n",
+    "    # Align labels to BVP sampling rate by nearest-neighbour downsampling\n",
+    "    n_bvp     = len(bvp)\n",
+    "    ratio     = LABEL_FS / BVP_FS                            # ~10.9375\n",
+    "    label_idx = np.round(np.arange(n_bvp) * ratio).astype(int)\n",
+    "    label_idx = np.clip(label_idx, 0, len(labels_full) - 1)\n",
+    "    labels    = labels_full[label_idx]                        # (N,)\n",
+    "\n",
+    "    return bvp, labels\n",
+    "\n",
+    "\n",
+    "# Quick sanity check\n",
+    "bvp_s2, lbl_s2 = load_subject('S2')\n",
+    "print(f'S2 — BVP shape: {bvp_s2.shape} | BVP range: [{bvp_s2.min():.2f}, {bvp_s2.max():.2f}]')\n",
+    "print(f'     Label shape: {lbl_s2.shape} | Unique labels: {np.unique(lbl_s2)}')\n",
+    "unique, counts = np.unique(lbl_s2, return_counts=True)\n",
+    "for u, c in zip(unique, counts):\n",
+    "    name = LABEL_MAP.get(u, f'other({u})')\n",
+    "    print(f'     Label {u} ({name:12s}): {c:6d} samples ({c/len(lbl_s2)*100:.1f}%)')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1.2 Filtering — Butterworth Bandpass (0.7–3.7 Hz)\n",
+    "\n",
+    "### Why Filtering?\n",
+    "\n",
+    "| Artifact | Frequency Range | Effect |\n",
+    "|---|---|---|\n",
+    "| Baseline wander | < 0.7 Hz | Breathing/motion shifts baseline, breaks peak detection |\n",
+    "| Cardiac signal | 0.7–3.7 Hz | Target — heart rate 40–220 BPM |\n",
+    "| High-freq noise | > 3.7 Hz | Electrical interference, sensor noise |\n",
+    "| Motion artifacts | Broadband | Wrist movement distortions |\n",
+    "\n",
+    "### Design Choices\n",
+    "- **Filter type**: Butterworth — maximally flat passband, no ripple, preserves waveform morphology\n",
+    "- **Low cutoff 0.7 Hz** / **High cutoff 3.7 Hz**: matches H-CNN paper exactly (heart rate at rest ≈40 BPM, tachycardia ≈220 BPM)\n",
+    "- **Order 3**: per the H-CNN paper specification\n",
+    "- **Zero-phase (`filtfilt`)**: applies filter forward + backward, eliminating phase shift"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# CHANGED: cutoff frequencies updated to 0.7–3.7 Hz and order 3\n",
+    "# per the H-CNN paper: \"butter-worth bandpass filter of order 3 with\n",
+    "# cutoff frequencies (f1=.7 Hz and f2=3.7 Hz)\"\n",
+    "def bandpass_filter(bvp: np.ndarray, fs: int = BVP_FS,\n",
+    "                    low: float = 0.7, high: float = 3.7, order: int = 3) -> np.ndarray:\n",
+    "    \"\"\"Zero-phase Butterworth bandpass filter (H-CNN paper spec).\"\"\"\n",
+    "    nyq = fs / 2.0\n",
+    "    b, a = sp_signal.butter(order, [low / nyq, high / nyq], btype='band')\n",
+    "    return sp_signal.filtfilt(b, a, bvp)\n",
+    "\n",
+    "\n",
+    "# Visualise filter frequency response\n",
+    "nyq  = BVP_FS / 2\n",
+    "b, a = sp_signal.butter(3, [0.7/nyq, 3.7/nyq], btype='band')\n",
+    "w, h = sp_signal.freqz(b, a, worN=4096, fs=BVP_FS)\n",
+    "\n",
+    "fig, ax = plt.subplots(figsize=(9, 3))\n",
+    "ax.plot(w, 20*np.log10(np.abs(h)+1e-12), color='steelblue', linewidth=1.8)\n",
+    "ax.axvline(0.7, color='tomato',     linestyle='--', label='Low cutoff 0.7 Hz')\n",
+    "ax.axvline(3.7, color='darkorange', linestyle='--', label='High cutoff 3.7 Hz')\n",
+    "ax.set_xlim(0, nyq); ax.set_ylim(-120, 5)\n",
+    "ax.set_xlabel('Frequency (Hz)'); ax.set_ylabel('Magnitude (dB)')\n",
+    "ax.set_title('3rd-Order Butterworth Bandpass — Frequency Response (H-CNN Paper Spec)')\n",
+    "ax.legend(); ax.grid(alpha=0.3)\n",
+    "plt.tight_layout(); plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1.3 Segmentation & Windowing\n",
+    "\n",
+    "Following both the WESAD paper (Schmidt et al. 2018) and the H-CNN paper (Rashid et al. 2021):\n",
+    "- **Window size**: 60 seconds (3840 samples at 64 Hz)\n",
+    "- **Step size**: 5 seconds (320 samples)\n",
+    "- **Label assignment**: majority vote within window; window discarded if majority label is not in {1, 2, 3}\n",
+    "\n",
+    "The 60-second window is required for valid LF/HF spectral features — the LF band starts at 0.04 Hz (period = 25 s), so at least 60 s is needed to capture two full LF cycles."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def segment_signal(bvp_filtered: np.ndarray, labels: np.ndarray,\n",
+    "                   win: int = WIN_SAMPLES, step: int = STEP_SAMPLES):\n",
+    "    \"\"\"Slide a window over a filtered BVP signal, assign majority label.\n",
+    "\n",
+    "    Returns\n",
+    "    -------\n",
+    "    windows    : np.ndarray, shape (W, win)\n",
+    "    win_labels : np.ndarray, shape (W,)\n",
+    "    \"\"\"\n",
+    "    windows, win_labels = [], []\n",
+    "    for start in range(0, len(bvp_filtered) - win + 1, step):\n",
+    "        seg  = bvp_filtered[start : start + win]\n",
+    "        lseg = labels[start : start + win]\n",
+    "\n",
+    "        # Majority vote label\n",
+    "        vals, cnts = np.unique(lseg, return_counts=True)\n",
+    "        majority   = vals[np.argmax(cnts)]\n",
+    "        frac       = cnts.max() / len(lseg)\n",
+    "\n",
+    "        # Keep only windows with a dominant valid label (>50%)\n",
+    "        if majority in VALID_LABELS and frac > 0.5:\n",
+    "            windows.append(seg)\n",
+    "            win_labels.append(majority)\n",
+    "\n",
+    "    return np.array(windows, dtype=np.float32), np.array(win_labels, dtype=np.int32)\n",
+    "\n",
+    "\n",
+    "# Quick test on S2\n",
+    "bvp_filt_s2 = bandpass_filter(bvp_s2)\n",
+    "wins_s2, wlbl_s2 = segment_signal(bvp_filt_s2, lbl_s2)\n",
+    "print(f'S2 — windows: {wins_s2.shape[0]:4d} | shape: {wins_s2.shape}')\n",
+    "unique, counts = np.unique(wlbl_s2, return_counts=True)\n",
+    "for u, c in zip(unique, counts):\n",
+    "    print(f'     Label {u} ({LABEL_MAP[u]:12s}): {c:4d} windows')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1.4 Full Dataset Preparation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def build_dataset():\n",
+    "    \"\"\"Load, filter, and segment all subjects.\n",
+    "\n",
+    "    Returns\n",
+    "    -------\n",
+    "    all_windows : list of np.ndarray — one array per subject, shape (W_i, WIN_SAMPLES)\n",
+    "    all_labels  : list of np.ndarray — one array per subject, shape (W_i,)\n",
+    "    \"\"\"\n",
+    "    all_windows, all_labels = [], []\n",
+    "    for sid in SUBJECTS:\n",
+    "        bvp, labels = load_subject(sid)\n",
+    "        bvp_f       = bandpass_filter(bvp)\n",
+    "        wins, wlbl  = segment_signal(bvp_f, labels)\n",
+    "        if len(wins) == 0:\n",
+    "            print(f'  {sid}: no usable windows — skipped')\n",
+    "            continue\n",
+    "        all_windows.append(wins)\n",
+    "        all_labels.append(wlbl)\n",
+    "        print(f'  {sid}: {wins.shape[0]:4d} windows | '\n",
+    "              + ' | '.join(f'{LABEL_MAP[u]}={c}'\n",
+    "                           for u, c in zip(*np.unique(wlbl, return_counts=True))))\n",
+    "    return all_windows, all_labels\n",
+    "\n",
+    "\n",
+    "print('Building dataset...')\n",
+    "all_windows, all_labels = build_dataset()\n",
+    "\n",
+    "total = sum(len(w) for w in all_windows)\n",
+    "print(f'\\nTotal: {len(all_windows)} subjects | {total} windows')\n",
+    "print('\\nGlobal class distribution:')\n",
+    "all_lbl_flat = np.concatenate(all_labels)\n",
+    "for u, c in zip(*np.unique(all_lbl_flat, return_counts=True)):\n",
+    "    print(f'  {LABEL_MAP[u]:12s}: {c:5d} ({c/total*100:.1f}%)')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1.5 PPG Visualization\n",
+    "\n",
+    "Below we visualize raw vs. filtered PPG segments across the three emotion conditions."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def plot_ppg_conditions(bvp_raw, bvp_filt, labels, subject='S2', n_sec=10):\n",
+    "    \"\"\"Plot raw and filtered PPG for each emotion condition.\"\"\"\n",
+    "    n_samples = n_sec * BVP_FS\n",
+    "    colors    = {'Baseline': '#4C72B0', 'Stress': '#DD8452', 'Amusement': '#55A868'}\n",
+    "\n",
+    "    fig, axes = plt.subplots(3, 2, figsize=(14, 8), sharex=False)\n",
+    "    fig.suptitle(f'Subject {subject} — Raw vs Filtered PPG Segments ({n_sec}s each)',\n",
+    "                 fontsize=13, fontweight='bold')\n",
+    "\n",
+    "    for row, (lbl_id, name) in enumerate(LABEL_MAP.items()):\n",
+    "        idx = np.where(labels == lbl_id)[0]\n",
+    "        if len(idx) == 0:\n",
+    "            axes[row, 0].set_visible(False)\n",
+    "            axes[row, 1].set_visible(False)\n",
+    "            continue\n",
+    "\n",
+    "        start = idx[0]\n",
+    "        end   = min(start + n_samples, len(bvp_raw))\n",
+    "        t     = np.arange(end - start) / BVP_FS\n",
+    "        color = colors[name]\n",
+    "\n",
+    "        axes[row, 0].plot(t, bvp_raw[start:end],  color=color, linewidth=0.8, alpha=0.85)\n",
+    "        axes[row, 0].set_title(f'{name} — Raw PPG', fontsize=10)\n",
+    "        axes[row, 0].set_ylabel('Amplitude')\n",
+    "\n",
+    "        axes[row, 1].plot(t, bvp_filt[start:end], color=color, linewidth=0.9)\n",
+    "        axes[row, 1].set_title(f'{name} — Filtered PPG (0.7–3.7 Hz)', fontsize=10)\n",
+    "\n",
+    "        for ax in axes[row]:\n",
+    "            ax.set_xlabel('Time (s)')\n",
+    "            ax.grid(alpha=0.25)\n",
+    "\n",
+    "    plt.tight_layout()\n",
+    "    plt.savefig('ppg_visualization.png', dpi=150, bbox_inches='tight')\n",
+    "    plt.show()\n",
+    "    print('Figure saved as ppg_visualization.png')\n",
+    "\n",
+    "\n",
+    "plot_ppg_conditions(bvp_s2, bvp_filt_s2, lbl_s2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def plot_window_samples(windows, labels, subject='S2'):\n",
+    "    \"\"\"Show one example window per class after preprocessing.\"\"\"\n",
+    "    fig, axes = plt.subplots(1, 3, figsize=(15, 3))\n",
+    "    fig.suptitle(f'Subject {subject} — Processed PPG Windows ({WIN_SEC}s each)', fontsize=12)\n",
+    "    t = np.linspace(0, WIN_SEC, WIN_SAMPLES)\n",
+    "\n",
+    "    for i, (lbl_id, name) in enumerate(LABEL_MAP.items()):\n",
+    "        idx_list = np.where(labels == lbl_id)[0]\n",
+    "        if len(idx_list) == 0:\n",
+    "            axes[i].set_visible(False)\n",
+    "            continue\n",
+    "        seg = windows[idx_list[0]]\n",
+    "        axes[i].plot(t, seg, linewidth=0.8)\n",
+    "        axes[i].set_title(f'{name}', fontweight='bold')\n",
+    "        axes[i].set_xlabel('Time (s)'); axes[i].set_ylabel('Amplitude')\n",
+    "        axes[i].grid(alpha=0.3)\n",
+    "\n",
+    "    plt.tight_layout()\n",
+    "    plt.savefig('ppg_windows.png', dpi=150, bbox_inches='tight')\n",
+    "    plt.show()\n",
+    "\n",
+    "\n",
+    "plot_window_samples(wins_s2, wlbl_s2)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "# Section 2: Methodology (30 pts)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2.1 Feature Extraction — Approach 2 (Feature-Based)\n",
+    "\n",
+    "We extract the full 19-feature vector from Table I of the H-CNN paper (Rashid et al. 2021),\n",
+    "which mirrors the WESAD benchmark (Schmidt et al. 2018). All four HRV frequency bands are used:\n",
+    "ULF (0.01–0.04 Hz), LF (0.04–0.15 Hz), HF (0.15–0.4 Hz), UHF (0.4–1.0 Hz).\n",
+    "\n",
+    "| # | Feature | Description |\n",
+    "|---|---|---|\n",
+    "| 1 | **μ_HR** | Mean heart rate (BPM) |\n",
+    "| 2 | **σ_HR** | Std of heart rate (BPM) |\n",
+    "| 3 | **μ_HRV** | Mean inter-beat interval (ms) |\n",
+    "| 4 | **SDNN** | Std of NN intervals — overall HRV |\n",
+    "| 5 | **NN50** | Count of consecutive IBI diffs > 50 ms |\n",
+    "| 6 | **pNN50** | Percentage of IBI diffs > 50 ms |\n",
+    "| 7 | **RMSSD** | Root mean square of successive IBI diffs |\n",
+    "| 8 | **TINN** | Triangular interpolation index of NN histogram |\n",
+    "| 9 | **ULF** | Power in ultra-low frequency band (0.01–0.04 Hz) |\n",
+    "| 10 | **LF** | Power in low frequency band (0.04–0.15 Hz) |\n",
+    "| 11 | **HF** | Power in high frequency band (0.15–0.4 Hz) |\n",
+    "| 12 | **UHF** | Power in ultra-high frequency band (0.4–1.0 Hz) |\n",
+    "| 13 | **LF/HF** | Sympathovagal balance ratio |\n",
+    "| 14 | **Σf** | Total spectral power (ULF+LF+HF+UHF) |\n",
+    "| 15 | **rel_LF** | Relative LF power (LF / total) |\n",
+    "| 16 | **rel_HF** | Relative HF power (HF / total) |\n",
+    "| 17 | **rel_ULF** | Relative ULF power (ULF / total) |\n",
+    "| 18 | **LF_norm** | Normalised LF power (LF / (LF+HF)) |\n",
+    "| 19 | **HF_norm** | Normalised HF power (HF / (LF+HF)) |"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# CHANGED: Updated to 19 features matching H-CNN / WESAD papers exactly.\n",
+    "# Key additions:\n",
+    "#   - σ_HR, NN50 (previously missing time-domain features)\n",
+    "#   - ULF and UHF frequency bands (0.01-0.04 Hz and 0.4-1.0 Hz)\n",
+    "#   - sum_freq, rel_LF, rel_HF, rel_ULF (derived spectral features)\n",
+    "#   - LF_norm, HF_norm (normalized LF/HF — most-cited form)\n",
+    "#   - TINN (triangular interpolation of NN histogram)\n",
+    "# Removed: signal morphology features (sig_mean, sig_std, etc.) — not in either reference paper.\n",
+    "\n",
+    "def extract_features(window: np.ndarray, fs: int = BVP_FS) -> np.ndarray:\n",
+    "    \"\"\"Extract 19 HRV features per H-CNN Table I / WESAD Table 1.\"\"\"\n",
+    "    feats = {}\n",
+    "\n",
+    "    # ── Peak detection ────────────────────────────────────────────────────\n",
+    "    # min_distance = 0.4s (150 BPM max) → 0.4 * 64 = ~26 samples\n",
+    "    peaks, _ = find_peaks(window, distance=int(0.4 * fs), height=window.mean())\n",
+    "\n",
+    "    # ── Time-domain HRV ──────────────────────────────────────────────────\n",
+    "    if len(peaks) >= 2:\n",
+    "        ibi_s    = np.diff(peaks) / fs        # IBI in seconds\n",
+    "        ibi_ms   = ibi_s * 1000               # IBI in milliseconds\n",
+    "        hr_inst  = 60.0 / ibi_s               # instantaneous HR (BPM)\n",
+    "\n",
+    "        feats['mean_HR']  = hr_inst.mean()\n",
+    "        feats['std_HR']   = hr_inst.std()\n",
+    "        feats['mean_IBI'] = ibi_ms.mean()\n",
+    "        feats['SDNN']     = ibi_ms.std()\n",
+    "\n",
+    "        diff_ibi = np.diff(ibi_ms)\n",
+    "        feats['NN50']  = float((np.abs(diff_ibi) > 50).sum()) if len(diff_ibi) > 0 else 0.0\n",
+    "        feats['pNN50'] = (np.abs(diff_ibi) > 50).mean() * 100 if len(diff_ibi) > 0 else 0.0\n",
+    "        feats['RMSSD'] = float(np.sqrt(np.mean(diff_ibi**2))) if len(diff_ibi) > 0 else 0.0\n",
+    "\n",
+    "        # TINN: triangular interpolation of NN interval histogram\n",
+    "        # Approximated as histogram range / height at mode bin\n",
+    "        if len(ibi_ms) >= 4:\n",
+    "            hist, bin_edges = np.histogram(ibi_ms, bins=max(4, len(ibi_ms) // 4))\n",
+    "            if hist.max() > 0:\n",
+    "                bin_width = bin_edges[1] - bin_edges[0]\n",
+    "                feats['TINN'] = float((ibi_ms.max() - ibi_ms.min()) / (hist.max() * bin_width + 1e-8))\n",
+    "            else:\n",
+    "                feats['TINN'] = 0.0\n",
+    "        else:\n",
+    "            feats['TINN'] = 0.0\n",
+    "    else:\n",
+    "        for k in ['mean_HR','std_HR','mean_IBI','SDNN','NN50','pNN50','RMSSD','TINN']:\n",
+    "            feats[k] = 0.0\n",
+    "        ibi_s = np.array([])\n",
+    "\n",
+    "    # ── Frequency-domain (Welch PSD on interpolated IBI) ─────────────────\n",
+    "    # All four bands from WESAD / H-CNN papers:\n",
+    "    #   ULF: 0.01–0.04 Hz | LF: 0.04–0.15 Hz | HF: 0.15–0.4 Hz | UHF: 0.4–1.0 Hz\n",
+    "    ulf_power = lf_power = hf_power = uhf_power = 0.0\n",
+    "\n",
+    "    if len(peaks) >= 4:\n",
+    "        try:\n",
+    "            ibi_s_fd  = np.diff(peaks) / fs\n",
+    "            t_beats   = peaks[1:] / fs\n",
+    "            t_uniform = np.arange(t_beats[0], t_beats[-1], 1/4.0)  # 4 Hz uniform grid\n",
+    "            ibi_interp = np.interp(t_uniform, t_beats, ibi_s_fd)\n",
+    "\n",
+    "            if len(ibi_interp) >= 16:\n",
+    "                freqs, psd = welch(ibi_interp, fs=4.0,\n",
+    "                                   nperseg=min(len(ibi_interp), 256))\n",
+    "                ulf_mask  = (freqs >= 0.01) & (freqs < 0.04)\n",
+    "                lf_mask   = (freqs >= 0.04) & (freqs < 0.15)\n",
+    "                hf_mask   = (freqs >= 0.15) & (freqs < 0.40)\n",
+    "                uhf_mask  = (freqs >= 0.40) & (freqs < 1.00)\n",
+    "\n",
+    "                ulf_power = float(psd[ulf_mask].sum())\n",
+    "                lf_power  = float(psd[lf_mask].sum())\n",
+    "                hf_power  = float(psd[hf_mask].sum())\n",
+    "                uhf_power = float(psd[uhf_mask].sum())\n",
+    "        except Exception:\n",
+    "            pass\n",
+    "\n",
+    "    total_power = ulf_power + lf_power + hf_power + uhf_power + 1e-8\n",
+    "    lf_hf_denom = lf_power + hf_power + 1e-8\n",
+    "\n",
+    "    feats['ULF_power'] = ulf_power\n",
+    "    feats['LF_power']  = lf_power\n",
+    "    feats['HF_power']  = hf_power\n",
+    "    feats['UHF_power'] = uhf_power\n",
+    "    feats['LF_HF']     = lf_power / (hf_power + 1e-8)\n",
+    "    feats['sum_freq']  = total_power\n",
+    "    feats['rel_LF']    = lf_power  / total_power\n",
+    "    feats['rel_HF']    = hf_power  / total_power\n",
+    "    feats['rel_ULF']   = ulf_power / total_power\n",
+    "    feats['LF_norm']   = lf_power  / lf_hf_denom\n",
+    "    feats['HF_norm']   = hf_power  / lf_hf_denom\n",
+    "\n",
+    "    return np.array(list(feats.values()), dtype=np.float32)\n",
+    "\n",
+    "\n",
+    "FEATURE_NAMES = [\n",
+    "    'mean_HR', 'std_HR', 'mean_IBI', 'SDNN', 'NN50', 'pNN50', 'RMSSD', 'TINN',\n",
+    "    'ULF_power', 'LF_power', 'HF_power', 'UHF_power',\n",
+    "    'LF_HF', 'sum_freq', 'rel_LF', 'rel_HF', 'rel_ULF', 'LF_norm', 'HF_norm'\n",
+    "]\n",
+    "N_FEATURES = len(FEATURE_NAMES)\n",
+    "print(f'Feature vector size: {N_FEATURES}  (target: 19)')  # must print 19\n",
+    "assert N_FEATURES == 19, f'Expected 19 features, got {N_FEATURES}'\n",
+    "\n",
+    "# Test on first window of S2\n",
+    "sample_feat = extract_features(wins_s2[0])\n",
+    "for name, val in zip(FEATURE_NAMES, sample_feat):\n",
+    "    print(f'  {name:12s}: {val:.6f}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def extract_features_batch(windows: np.ndarray) -> np.ndarray:\n",
+    "    \"\"\"Extract features from all windows for one subject.\"\"\"\n",
+    "    return np.stack([extract_features(w) for w in windows])\n",
+    "\n",
+    "\n",
+    "def build_feature_dataset():\n",
+    "    \"\"\"Build per-subject feature matrices (19 features).\n",
+    "\n",
+    "    Returns\n",
+    "    -------\n",
+    "    feat_per_subject : list of np.ndarray (W_i, 19)\n",
+    "    lbl_per_subject  : list of np.ndarray (W_i,)\n",
+    "    \"\"\"\n",
+    "    feat_per_subject, lbl_per_subject = [], []\n",
+    "    for i, (wins, lbls) in enumerate(zip(all_windows, all_labels)):\n",
+    "        print(f'  Extracting features for {SUBJECTS[i]} ({len(wins)} windows)...', end='\\r')\n",
+    "        feats = extract_features_batch(wins)\n",
+    "        feat_per_subject.append(feats)\n",
+    "        lbl_per_subject.append(lbls)\n",
+    "    print('\\nDone.')\n",
+    "    return feat_per_subject, lbl_per_subject\n",
+    "\n",
+    "\n",
+    "print('Extracting HRV features for all subjects...')\n",
+    "feat_per_subject, lbl_per_subject = build_feature_dataset()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2.2 Feature-Based Classifiers — Approach 2\n",
+    "\n",
+    "### Leave-One-Subject-Out (LOSO) Cross-Validation\n",
+    "\n",
+    "We evaluate using **Leave-One-Subject-Out** (LOSO): train on N-1 subjects, test on the held-out subject. This matches the evaluation protocol used in both reference papers.\n",
+    "\n",
+    "### Models\n",
+    "- **SVM (RBF kernel)** — strong non-linear classifier; well-suited for small feature sets\n",
+    "- **Random Forest (100 trees)** — ensemble that handles feature interactions naturally"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def loso_evaluate_classical(feat_per_subject, lbl_per_subject, clf_factory, name='SVM'):\n",
+    "    \"\"\"LOSO cross-validation for a sklearn classifier.\n",
+    "\n",
+    "    Returns aggregated predictions and ground-truth across all folds.\n",
+    "    \"\"\"\n",
+    "    all_preds, all_true = [], []\n",
+    "    n = len(feat_per_subject)\n",
+    "\n",
+    "    for test_idx in range(n):\n",
+    "        X_train = np.concatenate([feat_per_subject[i] for i in range(n) if i != test_idx])\n",
+    "        y_train = np.concatenate([lbl_per_subject[i]  for i in range(n) if i != test_idx])\n",
+    "        X_test  = feat_per_subject[test_idx]\n",
+    "        y_test  = lbl_per_subject[test_idx]\n",
+    "\n",
+    "        scaler  = StandardScaler()\n",
+    "        X_train = scaler.fit_transform(X_train)\n",
+    "        X_test  = scaler.transform(X_test)\n",
+    "\n",
+    "        X_train = np.nan_to_num(X_train)\n",
+    "        X_test  = np.nan_to_num(X_test)\n",
+    "\n",
+    "        clf = clf_factory()\n",
+    "        clf.fit(X_train, y_train)\n",
+    "        preds = clf.predict(X_test)\n",
+    "\n",
+    "        all_preds.append(preds)\n",
+    "        all_true.append(y_test)\n",
+    "        print(f'  Fold {test_idx+1:2d}/{n} ({SUBJECTS[test_idx]}): '\n",
+    "              f'acc={accuracy_score(y_test, preds):.3f}')\n",
+    "\n",
+    "    return np.concatenate(all_true), np.concatenate(all_preds)\n",
+    "\n",
+    "\n",
+    "print('=' * 55)\n",
+    "print('SVM (RBF kernel) — LOSO Cross-Validation')\n",
+    "print('=' * 55)\n",
+    "y_true_svm, y_pred_svm = loso_evaluate_classical(\n",
+    "    feat_per_subject, lbl_per_subject,\n",
+    "    clf_factory=lambda: SVC(kernel='rbf', C=10, gamma='scale', class_weight='balanced'),\n",
+    "    name='SVM'\n",
+    ")\n",
+    "\n",
+    "print('\\n' + '=' * 55)\n",
+    "print('Random Forest — LOSO Cross-Validation')\n",
+    "print('=' * 55)\n",
+    "y_true_rf, y_pred_rf = loso_evaluate_classical(\n",
+    "    feat_per_subject, lbl_per_subject,\n",
+    "    clf_factory=lambda: RandomForestClassifier(n_estimators=100, max_depth=None,\n",
+    "                                               class_weight='balanced', random_state=42),\n",
+    "    name='RF'\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2.3 CNN Models — Approach 1 (End-to-End)\n",
+    "\n",
+    "We implement two variants following the H-CNN paper (Rashid et al. 2021):\n",
+    "\n",
+    "**Normal CNN** — raw 60s PPG segment (3840 samples) → 3 conv blocks → global average pooling → softmax.\n",
+    "\n",
+    "**Hybrid CNN (H-CNN)** — same CNN backbone **concatenated** with the 19-feature vector (passed through a small dense layer), then classified. This is the novel contribution of the H-CNN paper and the primary model to compare.\n",
+    "\n",
+    "```\n",
+    "H-CNN Architecture:\n",
+    "\n",
+    "Segment Input (3840×1)\n",
+    "  └─ Dropout(0.2)\n",
+    "  └─ Conv1(k=64, s=4, ReLU) → AvgPool → BN → Dropout(0.5)  [945×8 → 236×8]\n",
+    "  └─ Conv2(k=32, s=2, ReLU) → AvgPool → BN → Dropout(0.5)  [103×16 → 25×16]\n",
+    "  └─ Conv3(k=16, s=1, ReLU) → GlobalAvgPool                 [10×8 → 8]\n",
+    "  └─ Flatten → [8]\n",
+    "                                    ┐\n",
+    "                               Concat [8+4=12]\n",
+    "                                    ┘\n",
+    "Feature Input (19)\n",
+    "  └─ Dropout(0.2)\n",
+    "  └─ Dense(ReLU) → [4]\n",
+    "\n",
+    "Output Dense → [n_classes]\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Normal CNN ─────────────────────────────────────────────────────────────\n",
+    "# Architecture per H-CNN paper Table II (normal CNN branch only).\n",
+    "# Input: 3840-sample windows (60s × 64 Hz)\n",
+    "class PPG_CNN(nn.Module):\n",
+    "    \"\"\"Normal 1D CNN — end-to-end emotion classification from PPG windows.\n",
+    "    Follows the CNN branch of the H-CNN paper (Rashid et al. 2021).\n",
+    "    \"\"\"\n",
+    "\n",
+    "    def __init__(self, n_classes: int = 3):\n",
+    "        super().__init__()\n",
+    "\n",
+    "        # Conv block: Conv → ReLU → AvgPool → BatchNorm\n",
+    "        # Sizes follow H-CNN Table II\n",
+    "        self.do1   = nn.Dropout(0.20)\n",
+    "\n",
+    "        self.conv1 = nn.Conv1d(1,  8,  kernel_size=64, stride=4, bias=False)\n",
+    "        self.relu1 = nn.ReLU(inplace=True)\n",
+    "        self.pool1 = nn.AvgPool1d(kernel_size=4, stride=4)\n",
+    "        self.bn1   = nn.BatchNorm1d(8)\n",
+    "        self.do2   = nn.Dropout(0.50)\n",
+    "\n",
+    "        self.conv2 = nn.Conv1d(8,  16, kernel_size=32, stride=2, bias=False)\n",
+    "        self.relu2 = nn.ReLU(inplace=True)\n",
+    "        self.pool2 = nn.AvgPool1d(kernel_size=4, stride=4)\n",
+    "        self.bn2   = nn.BatchNorm1d(16)\n",
+    "        self.do3   = nn.Dropout(0.50)\n",
+    "\n",
+    "        self.conv3 = nn.Conv1d(16, 8,  kernel_size=16, stride=1, bias=False)\n",
+    "        self.relu3 = nn.ReLU(inplace=True)\n",
+    "        self.gpool = nn.AdaptiveAvgPool1d(1)   # Global average → (B, 8, 1)\n",
+    "\n",
+    "        self.classifier = nn.Linear(8, n_classes)\n",
+    "\n",
+    "    def forward(self, x):\n",
+    "        # x: (B, 1, 3840)\n",
+    "        x = self.do1(x)\n",
+    "        x = self.bn1(self.pool1(self.relu1(self.conv1(x))))\n",
+    "        x = self.do2(x)\n",
+    "        x = self.bn2(self.pool2(self.relu2(self.conv2(x))))\n",
+    "        x = self.do3(x)\n",
+    "        x = self.gpool(self.relu3(self.conv3(x)))  # (B, 8, 1)\n",
+    "        x = x.squeeze(-1)                           # (B, 8)\n",
+    "        return self.classifier(x)                   # (B, n_classes)\n",
+    "\n",
+    "    def get_embedding(self, x):\n",
+    "        \"\"\"Return the 8-dim global pooling output (used for H-CNN concatenation).\"\"\"\n",
+    "        x = self.do1(x)\n",
+    "        x = self.bn1(self.pool1(self.relu1(self.conv1(x))))\n",
+    "        x = self.do2(x)\n",
+    "        x = self.bn2(self.pool2(self.relu2(self.conv2(x))))\n",
+    "        x = self.do3(x)\n",
+    "        x = self.gpool(self.relu3(self.conv3(x)))\n",
+    "        return x.squeeze(-1)   # (B, 8)\n",
+    "\n",
+    "\n",
+    "# ── Hybrid CNN (H-CNN) ─────────────────────────────────────────────────────\n",
+    "# Concatenates CNN global pooling output (dim=8) with feature dense output (dim=4)\n",
+    "# → combined dim=12 → output dense → n_classes\n",
+    "class PPG_HCNN(nn.Module):\n",
+    "    \"\"\"Hybrid CNN: CNN branch + feature branch, concatenated before output.\n",
+    "    Implements the H-CNN architecture from Rashid et al. (EMBC 2021), Table II.\n",
+    "    \"\"\"\n",
+    "\n",
+    "    def __init__(self, n_features: int = N_FEATURES, n_classes: int = 3):\n",
+    "        super().__init__()\n",
+    "\n",
+    "        # Shared CNN backbone\n",
+    "        self.cnn = PPG_CNN(n_classes=n_classes)   # we'll use get_embedding(), not forward()\n",
+    "\n",
+    "        # Feature branch\n",
+    "        self.feat_do   = nn.Dropout(0.20)\n",
+    "        self.feat_fc   = nn.Linear(n_features, 4)\n",
+    "        self.feat_relu = nn.ReLU(inplace=True)\n",
+    "\n",
+    "        # Output: 8 (CNN) + 4 (features) = 12 → n_classes\n",
+    "        self.out = nn.Linear(8 + 4, n_classes)\n",
+    "\n",
+    "    def forward(self, x_seg, x_feat):\n",
+    "        \"\"\"\n",
+    "        x_seg  : (B, 1, WIN_SAMPLES) — raw PPG window\n",
+    "        x_feat : (B, N_FEATURES)     — 19-feature HRV vector\n",
+    "        \"\"\"\n",
+    "        cnn_emb  = self.cnn.get_embedding(x_seg)          # (B, 8)\n",
+    "        feat_emb = self.feat_relu(self.feat_fc(self.feat_do(x_feat)))  # (B, 4)\n",
+    "        combined = torch.cat([cnn_emb, feat_emb], dim=1)  # (B, 12)\n",
+    "        return self.out(combined)                          # (B, n_classes)\n",
+    "\n",
+    "\n",
+    "# ── Shape check ────────────────────────────────────────────────────────────\n",
+    "dummy_seg  = torch.randn(4, 1, WIN_SAMPLES)\n",
+    "dummy_feat = torch.randn(4, N_FEATURES)\n",
+    "\n",
+    "cnn_model  = PPG_CNN(n_classes=3)\n",
+    "hcnn_model = PPG_HCNN(n_features=N_FEATURES, n_classes=3)\n",
+    "\n",
+    "cnn_params  = sum(p.numel() for p in cnn_model.parameters()  if p.requires_grad)\n",
+    "hcnn_params = sum(p.numel() for p in hcnn_model.parameters() if p.requires_grad)\n",
+    "\n",
+    "print(f'Normal CNN  — input: {list(dummy_seg.shape)} → output: {list(cnn_model(dummy_seg).shape)}')\n",
+    "print(f'             trainable params: {cnn_params:,}')\n",
+    "print(f'H-CNN       — seg: {list(dummy_seg.shape)}, feat: {list(dummy_feat.shape)} → '\n",
+    "      f'output: {list(hcnn_model(dummy_seg, dummy_feat).shape)}')\n",
+    "print(f'             trainable params: {hcnn_params:,}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Label remapping: {1,2,3} → {0,1,2} for CrossEntropyLoss ───────────────\n",
+    "LABEL_TO_IDX = {1: 0, 2: 1, 3: 2}   # Baseline=0, Stress=1, Amusement=2\n",
+    "IDX_TO_LABEL = {v: k for k, v in LABEL_TO_IDX.items()}\n",
+    "N_CLASSES    = 3\n",
+    "\n",
+    "\n",
+    "def _zscore_windows(X: np.ndarray) -> np.ndarray:\n",
+    "    \"\"\"Per-window z-score normalisation (zero mean, unit variance).\"\"\"\n",
+    "    return (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)\n",
+    "\n",
+    "\n",
+    "def _class_weights(y: np.ndarray, n_classes: int) -> torch.Tensor:\n",
+    "    \"\"\"Compute inverse-frequency class weights per H-CNN paper (Eq. 5).\"\"\"\n",
+    "    counts  = np.bincount(y, minlength=n_classes).astype(float)\n",
+    "    weights = (1.0 / (counts + 1e-8)) * (len(y) / n_classes)\n",
+    "    return torch.tensor(weights / weights.sum() * n_classes, dtype=torch.float32)\n",
+    "\n",
+    "\n",
+    "def train_cnn_fold(X_win_tr, y_tr_raw, X_win_te, y_te_raw,\n",
+    "                   epochs=50, batch_size=64, lr=1e-3, patience=15):\n",
+    "    \"\"\"Train Normal CNN for one LOSO fold. Returns label-space predictions.\"\"\"\n",
+    "    # Z-score normalisation\n",
+    "    X_tr_n = _zscore_windows(X_win_tr)\n",
+    "    X_te_n = _zscore_windows(X_win_te)\n",
+    "\n",
+    "    X_tr_t = torch.tensor(X_tr_n[:, np.newaxis, :], dtype=torch.float32)\n",
+    "    X_te_t = torch.tensor(X_te_n[:, np.newaxis, :], dtype=torch.float32)\n",
+    "    del X_tr_n, X_te_n\n",
+    "\n",
+    "    y_tr = np.array([LABEL_TO_IDX[l] for l in y_tr_raw], dtype=np.int64)\n",
+    "    y_te = np.array([LABEL_TO_IDX[l] for l in y_te_raw], dtype=np.int64)\n",
+    "\n",
+    "    cw     = _class_weights(y_tr, N_CLASSES).to(DEVICE)\n",
+    "    y_tr_t = torch.tensor(y_tr, dtype=torch.long)\n",
+    "    loader = DataLoader(TensorDataset(X_tr_t, y_tr_t),\n",
+    "                        batch_size=batch_size, shuffle=True, drop_last=False)\n",
+    "\n",
+    "    model     = PPG_CNN(n_classes=N_CLASSES).to(DEVICE)\n",
+    "    criterion = nn.CrossEntropyLoss(weight=cw)\n",
+    "    optimizer = optim.Adam(model.parameters(), lr=lr)\n",
+    "    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)\n",
+    "\n",
+    "    model.train()\n",
+    "    for epoch in range(epochs):\n",
+    "        for Xb, yb in loader:\n",
+    "            Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)\n",
+    "            optimizer.zero_grad()\n",
+    "            criterion(model(Xb), yb).backward()\n",
+    "            optimizer.step()\n",
+    "        scheduler.step()\n",
+    "\n",
+    "    del loader, optimizer, scheduler, criterion, cw, y_tr_t, X_tr_t\n",
+    "    gc.collect()\n",
+    "    if DEVICE.type == 'cuda':\n",
+    "        torch.cuda.empty_cache()\n",
+    "\n",
+    "    # Inference\n",
+    "    model.eval()\n",
+    "    preds = []\n",
+    "    with torch.no_grad():\n",
+    "        for i in range(0, len(X_te_t), 256):\n",
+    "            preds.append(model(X_te_t[i:i+256].to(DEVICE)).argmax(1).cpu().numpy())\n",
+    "    pred_idx = np.concatenate(preds)\n",
+    "\n",
+    "    del model, X_te_t\n",
+    "    gc.collect()\n",
+    "    if DEVICE.type == 'cuda':\n",
+    "        torch.cuda.empty_cache()\n",
+    "\n",
+    "    return np.array([IDX_TO_LABEL[p] for p in pred_idx])\n",
+    "\n",
+    "\n",
+    "def train_hcnn_fold(X_win_tr, X_feat_tr, y_tr_raw,\n",
+    "                    X_win_te, X_feat_te, y_te_raw,\n",
+    "                    epochs=50, batch_size=64, lr=1e-3):\n",
+    "    \"\"\"Train Hybrid CNN (H-CNN) for one LOSO fold. Returns label-space predictions.\"\"\"\n",
+    "    # Z-score on windows + feature z-score\n",
+    "    X_tr_n = _zscore_windows(X_win_tr)\n",
+    "    X_te_n = _zscore_windows(X_win_te)\n",
+    "\n",
+    "    scaler  = StandardScaler()\n",
+    "    F_tr_n  = np.nan_to_num(scaler.fit_transform(X_feat_tr)).astype(np.float32)\n",
+    "    F_te_n  = np.nan_to_num(scaler.transform(X_feat_te)).astype(np.float32)\n",
+    "\n",
+    "    X_tr_t = torch.tensor(X_tr_n[:, np.newaxis, :], dtype=torch.float32)\n",
+    "    X_te_t = torch.tensor(X_te_n[:, np.newaxis, :], dtype=torch.float32)\n",
+    "    F_tr_t = torch.tensor(F_tr_n, dtype=torch.float32)\n",
+    "    F_te_t = torch.tensor(F_te_n, dtype=torch.float32)\n",
+    "    del X_tr_n, X_te_n, F_tr_n, F_te_n\n",
+    "\n",
+    "    y_tr = np.array([LABEL_TO_IDX[l] for l in y_tr_raw], dtype=np.int64)\n",
+    "    y_te = np.array([LABEL_TO_IDX[l] for l in y_te_raw], dtype=np.int64)\n",
+    "\n",
+    "    cw     = _class_weights(y_tr, N_CLASSES).to(DEVICE)\n",
+    "    y_tr_t = torch.tensor(y_tr, dtype=torch.long)\n",
+    "    loader = DataLoader(TensorDataset(X_tr_t, F_tr_t, y_tr_t),\n",
+    "                        batch_size=batch_size, shuffle=True, drop_last=False)\n",
+    "\n",
+    "    model     = PPG_HCNN(n_features=N_FEATURES, n_classes=N_CLASSES).to(DEVICE)\n",
+    "    criterion = nn.CrossEntropyLoss(weight=cw)\n",
+    "    optimizer = optim.Adam(model.parameters(), lr=lr)\n",
+    "    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)\n",
+    "\n",
+    "    model.train()\n",
+    "    for epoch in range(epochs):\n",
+    "        for Xb, Fb, yb in loader:\n",
+    "            Xb, Fb, yb = Xb.to(DEVICE), Fb.to(DEVICE), yb.to(DEVICE)\n",
+    "            optimizer.zero_grad()\n",
+    "            criterion(model(Xb, Fb), yb).backward()\n",
+    "            optimizer.step()\n",
+    "        scheduler.step()\n",
+    "\n",
+    "    del loader, optimizer, scheduler, criterion, cw, y_tr_t, X_tr_t, F_tr_t\n",
+    "    gc.collect()\n",
+    "    if DEVICE.type == 'cuda':\n",
+    "        torch.cuda.empty_cache()\n",
+    "\n",
+    "    # Inference\n",
+    "    model.eval()\n",
+    "    preds = []\n",
+    "    with torch.no_grad():\n",
+    "        for i in range(0, len(X_te_t), 256):\n",
+    "            seg_b  = X_te_t[i:i+256].to(DEVICE)\n",
+    "            feat_b = F_te_t[i:i+256].to(DEVICE)\n",
+    "            preds.append(model(seg_b, feat_b).argmax(1).cpu().numpy())\n",
+    "    pred_idx = np.concatenate(preds)\n",
+    "\n",
+    "    del model, X_te_t, F_te_t\n",
+    "    gc.collect()\n",
+    "    if DEVICE.type == 'cuda':\n",
+    "        torch.cuda.empty_cache()\n",
+    "\n",
+    "    return np.array([IDX_TO_LABEL[p] for p in pred_idx])\n",
+    "\n",
+    "\n",
+    "print('Label mapping:', LABEL_TO_IDX)\n",
+    "print('N_CLASSES:', N_CLASSES)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── LOSO for Normal CNN ────────────────────────────────────────────────────\n",
+    "print('Normal CNN — LOSO Cross-Validation')\n",
+    "print('=' * 55)\n",
+    "n = len(all_windows)\n",
+    "y_true_cnn, y_pred_cnn = [], []\n",
+    "\n",
+    "for test_idx in range(n):\n",
+    "    X_tr = np.concatenate([all_windows[i] for i in range(n) if i != test_idx])\n",
+    "    y_tr = np.concatenate([all_labels[i]  for i in range(n) if i != test_idx])\n",
+    "    X_te = all_windows[test_idx]\n",
+    "    y_te = all_labels[test_idx]\n",
+    "\n",
+    "    preds = train_cnn_fold(X_tr, y_tr, X_te, y_te, epochs=50)\n",
+    "    acc   = accuracy_score(y_te, preds)\n",
+    "    print(f'  Fold {test_idx+1:2d}/{n} ({SUBJECTS[test_idx]}): acc={acc:.3f}')\n",
+    "    y_true_cnn.append(y_te)\n",
+    "    y_pred_cnn.append(preds)\n",
+    "\n",
+    "    del X_tr, y_tr\n",
+    "    gc.collect()\n",
+    "    if DEVICE.type == 'cuda':\n",
+    "        torch.cuda.empty_cache()\n",
+    "\n",
+    "y_true_cnn = np.concatenate(y_true_cnn)\n",
+    "y_pred_cnn = np.concatenate(y_pred_cnn)\n",
+    "print('Done.')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── LOSO for H-CNN ─────────────────────────────────────────────────────────\n",
+    "print('Hybrid CNN (H-CNN) — LOSO Cross-Validation')\n",
+    "print('=' * 55)\n",
+    "y_true_hcnn, y_pred_hcnn = [], []\n",
+    "\n",
+    "for test_idx in range(n):\n",
+    "    X_tr_win  = np.concatenate([all_windows[i]       for i in range(n) if i != test_idx])\n",
+    "    X_tr_feat = np.concatenate([feat_per_subject[i]  for i in range(n) if i != test_idx])\n",
+    "    y_tr      = np.concatenate([all_labels[i]        for i in range(n) if i != test_idx])\n",
+    "\n",
+    "    X_te_win  = all_windows[test_idx]\n",
+    "    X_te_feat = feat_per_subject[test_idx]\n",
+    "    y_te      = all_labels[test_idx]\n",
+    "\n",
+    "    preds = train_hcnn_fold(X_tr_win, X_tr_feat, y_tr,\n",
+    "                            X_te_win, X_te_feat, y_te, epochs=50)\n",
+    "    acc   = accuracy_score(y_te, preds)\n",
+    "    print(f'  Fold {test_idx+1:2d}/{n} ({SUBJECTS[test_idx]}): acc={acc:.3f}')\n",
+    "    y_true_hcnn.append(y_te)\n",
+    "    y_pred_hcnn.append(preds)\n",
+    "\n",
+    "    del X_tr_win, X_tr_feat, y_tr\n",
+    "    gc.collect()\n",
+    "    if DEVICE.type == 'cuda':\n",
+    "        torch.cuda.empty_cache()\n",
+    "\n",
+    "y_true_hcnn = np.concatenate(y_true_hcnn)\n",
+    "y_pred_hcnn = np.concatenate(y_pred_hcnn)\n",
+    "print('Done.')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "# Section 3: Experiments & Analysis (10 pts)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "CLASS_NAMES = [LABEL_MAP[k] for k in sorted(LABEL_MAP.keys())]\n",
+    "\n",
+    "\n",
+    "def print_metrics(y_true, y_pred, model_name):\n",
+    "    acc = accuracy_score(y_true, y_pred)\n",
+    "    f1w = f1_score(y_true, y_pred, average='weighted')\n",
+    "    f1m = f1_score(y_true, y_pred, average='macro')\n",
+    "    print(f'\\n{\"─\" * 55}')\n",
+    "    print(f'  {model_name}')\n",
+    "    print(f'  Accuracy    : {acc*100:5.2f}%')\n",
+    "    print(f'  Weighted F1 : {f1w*100:5.2f}%')\n",
+    "    print(f'  Macro F1    : {f1m*100:5.2f}%')\n",
+    "    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=3))\n",
+    "    return acc, f1w, f1m\n",
+    "\n",
+    "\n",
+    "# ── 3-class results ────────────────────────────────────────────────────────\n",
+    "print('\\n3-CLASS RESULTS (Baseline vs. Stress vs. Amusement)')\n",
+    "print('=' * 55)\n",
+    "results = {}\n",
+    "results['SVM']          = print_metrics(y_true_svm,  y_pred_svm,  'SVM (RBF, feature-based)')\n",
+    "results['Random Forest'] = print_metrics(y_true_rf,   y_pred_rf,   'Random Forest (feature-based)')\n",
+    "results['Normal CNN']   = print_metrics(y_true_cnn,  y_pred_cnn,  'Normal CNN (end-to-end)')\n",
+    "results['H-CNN']        = print_metrics(y_true_hcnn, y_pred_hcnn, 'H-CNN (hybrid, end-to-end + features)')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Summary comparison table (mirrors H-CNN paper Figure 2 format) ─────────\n",
+    "print('\\n' + '=' * 65)\n",
+    "print(f'{\"Model\":<32} {\"Accuracy\":>10} {\"W-F1\":>8} {\"Macro-F1\":>10}')\n",
+    "print('─' * 65)\n",
+    "for name, (acc, f1w, f1m) in results.items():\n",
+    "    print(f'{name:<32} {acc*100:>9.2f}% {f1w*100:>7.2f}% {f1m*100:>9.2f}%')\n",
+    "print('=' * 65)\n",
+    "\n",
+    "# Reference numbers from H-CNN paper (BVP only, LOSO)\n",
+    "print('\\nReference (H-CNN paper, BVP only, LOSO):')\n",
+    "print(f'  {\"Normal CNN\":32} {\"68.52%\":>10} {\"\":>8} {\"57.67%\":>10}')\n",
+    "print(f'  {\"H-CNN\":32} {\"75.21%\":>10} {\"\":>8} {\"64.15%\":>10}')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Confusion matrices for all 4 models ───────────────────────────────────\n",
+    "fig, axes = plt.subplots(1, 4, figsize=(22, 5))\n",
+    "fig.suptitle('Confusion Matrices — 3-Class LOSO (Baseline / Stress / Amusement)',\n",
+    "             fontsize=13, fontweight='bold')\n",
+    "\n",
+    "model_results = [\n",
+    "    ('SVM',          y_true_svm,  y_pred_svm),\n",
+    "    ('Random Forest', y_true_rf,  y_pred_rf),\n",
+    "    ('Normal CNN',   y_true_cnn,  y_pred_cnn),\n",
+    "    ('H-CNN',        y_true_hcnn, y_pred_hcnn),\n",
+    "]\n",
+    "for ax, (name, yt, yp) in zip(axes, model_results):\n",
+    "    cm   = confusion_matrix(yt, yp, labels=sorted(LABEL_MAP.keys()), normalize='true')\n",
+    "    disp = ConfusionMatrixDisplay(cm, display_labels=CLASS_NAMES)\n",
+    "    disp.plot(ax=ax, colorbar=False, cmap='Blues', values_format='.2f')\n",
+    "    ax.set_title(f'{name}\\nAcc={accuracy_score(yt,yp)*100:.1f}%  '\n",
+    "                 f'MacroF1={f1_score(yt,yp,average=\"macro\")*100:.1f}%', fontsize=10)\n",
+    "    ax.set_xlabel('Predicted'); ax.set_ylabel('True')\n",
+    "\n",
+    "plt.tight_layout()\n",
+    "plt.savefig('confusion_matrices_3class.png', dpi=150, bbox_inches='tight')\n",
+    "plt.show()\n",
+    "print('Figure saved as confusion_matrices_3class.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Binary Classification: Stress vs. Non-stress ───────────────────────────\n",
+    "# Remap: Baseline (1) → 0 (non-stress), Stress (2) → 1 (stress),\n",
+    "#        Amusement (3) → 0 (non-stress)\n",
+    "# Per H-CNN paper Section V-C: \"baseline and amusement are considered\n",
+    "# as the non-stress class\"\n",
+    "\n",
+    "BINARY_MAP = {1: 0, 2: 1, 3: 0}   # 0=non-stress, 1=stress\n",
+    "BINARY_NAMES = ['Non-stress', 'Stress']\n",
+    "\n",
+    "def to_binary(y):\n",
+    "    return np.array([BINARY_MAP[l] for l in y])\n",
+    "\n",
+    "\n",
+    "print('\\n2-CLASS RESULTS (Stress vs. Non-stress)')\n",
+    "print('=' * 55)\n",
+    "\n",
+    "binary_results = {}\n",
+    "for name, yt, yp in [\n",
+    "    ('SVM',          y_true_svm,  y_pred_svm),\n",
+    "    ('Random Forest', y_true_rf,  y_pred_rf),\n",
+    "    ('Normal CNN',   y_true_cnn,  y_pred_cnn),\n",
+    "    ('H-CNN',        y_true_hcnn, y_pred_hcnn),\n",
+    "]:\n",
+    "    yt_b = to_binary(yt)\n",
+    "    yp_b = to_binary(yp)\n",
+    "    acc  = accuracy_score(yt_b, yp_b)\n",
+    "    f1m  = f1_score(yt_b, yp_b, average='macro')\n",
+    "    binary_results[name] = (acc, f1m)\n",
+    "    print(f'  {name:<32} Acc={acc*100:.2f}%  Macro-F1={f1m*100:.2f}%')\n",
+    "\n",
+    "print('\\nReference (H-CNN paper, BVP only, LOSO):')\n",
+    "print(f'  {\"Normal CNN\":32} Acc=82.06%  Macro-F1=78.94%')\n",
+    "print(f'  {\"H-CNN\":32} Acc=88.56%  Macro-F1=86.18%')\n",
+    "\n",
+    "\n",
+    "# Confusion matrices for binary task\n",
+    "fig, axes = plt.subplots(1, 4, figsize=(20, 4))\n",
+    "fig.suptitle('Confusion Matrices — Binary LOSO (Stress vs. Non-stress)',\n",
+    "             fontsize=12, fontweight='bold')\n",
+    "\n",
+    "for ax, (name, yt, yp) in zip(axes, [\n",
+    "    ('SVM',          y_true_svm,  y_pred_svm),\n",
+    "    ('Random Forest', y_true_rf,  y_pred_rf),\n",
+    "    ('Normal CNN',   y_true_cnn,  y_pred_cnn),\n",
+    "    ('H-CNN',        y_true_hcnn, y_pred_hcnn),\n",
+    "]):\n",
+    "    yt_b = to_binary(yt)\n",
+    "    yp_b = to_binary(yp)\n",
+    "    cm   = confusion_matrix(yt_b, yp_b, normalize='true')\n",
+    "    disp = ConfusionMatrixDisplay(cm, display_labels=BINARY_NAMES)\n",
+    "    disp.plot(ax=ax, colorbar=False, cmap='Oranges', values_format='.2f')\n",
+    "    ax.set_title(f'{name}\\nAcc={accuracy_score(yt_b,yp_b)*100:.1f}%  '\n",
+    "                 f'MacroF1={f1_score(yt_b,yp_b,average=\"macro\")*100:.1f}%', fontsize=10)\n",
+    "\n",
+    "plt.tight_layout()\n",
+    "plt.savefig('confusion_matrices_binary.png', dpi=150, bbox_inches='tight')\n",
+    "plt.show()\n",
+    "print('Figure saved as confusion_matrices_binary.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Per-class Macro F1 bar chart ───────────────────────────────────────────\n",
+    "fig, axes = plt.subplots(1, 2, figsize=(14, 5))\n",
+    "fig.suptitle('Model Comparison — LOSO WESAD BVP', fontsize=13, fontweight='bold')\n",
+    "\n",
+    "model_names = list(results.keys())\n",
+    "accs3  = [results[m][0] * 100 for m in model_names]\n",
+    "f1m3   = [results[m][2] * 100 for m in model_names]\n",
+    "accs2  = [binary_results[m][0] * 100 for m in model_names]\n",
+    "f1m2   = [binary_results[m][1] * 100 for m in model_names]\n",
+    "\n",
+    "x = np.arange(len(model_names))\n",
+    "colors_bar = ['#4C72B0', '#55A868', '#DD8452', '#C44E52']\n",
+    "\n",
+    "for ax, (accs, f1ms, title) in zip(axes, [\n",
+    "    (accs3, f1m3, '3-Class (Baseline / Stress / Amusement)'),\n",
+    "    (accs2, f1m2, 'Binary (Stress vs. Non-stress)'),\n",
+    "]):\n",
+    "    w = 0.35\n",
+    "    bars1 = ax.bar(x - w/2, accs,  w, label='Accuracy',  alpha=0.85)\n",
+    "    bars2 = ax.bar(x + w/2, f1ms,  w, label='Macro F1',  alpha=0.85)\n",
+    "    for bar in bars1 + bars2:\n",
+    "        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,\n",
+    "                f'{bar.get_height():.1f}', ha='center', va='bottom', fontsize=8)\n",
+    "    ax.set_xticks(x)\n",
+    "    ax.set_xticklabels(model_names, rotation=15, ha='right')\n",
+    "    ax.set_ylabel('Score (%)')\n",
+    "    ax.set_ylim(0, 105)\n",
+    "    ax.set_title(title)\n",
+    "    ax.legend()\n",
+    "    ax.grid(axis='y', alpha=0.3)\n",
+    "\n",
+    "plt.tight_layout()\n",
+    "plt.savefig('model_comparison.png', dpi=150, bbox_inches='tight')\n",
+    "plt.show()\n",
+    "print('Figure saved as model_comparison.png')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ── Per-subject accuracy — Random Forest (fastest to rerun) ────────────────\n",
+    "n = len(feat_per_subject)\n",
+    "rf_subject_accs = []\n",
+    "\n",
+    "for test_idx in range(n):\n",
+    "    X_tr = np.concatenate([feat_per_subject[i] for i in range(n) if i != test_idx])\n",
+    "    y_tr = np.concatenate([lbl_per_subject[i]  for i in range(n) if i != test_idx])\n",
+    "    X_te = feat_per_subject[test_idx]\n",
+    "    y_te = lbl_per_subject[test_idx]\n",
+    "\n",
+    "    sc   = StandardScaler()\n",
+    "    X_tr = np.nan_to_num(sc.fit_transform(X_tr))\n",
+    "    X_te = np.nan_to_num(sc.transform(X_te))\n",
+    "\n",
+    "    rf = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)\n",
+    "    rf.fit(X_tr, y_tr)\n",
+    "    rf_subject_accs.append(accuracy_score(y_te, rf.predict(X_te)))\n",
+    "\n",
+    "fig, ax = plt.subplots(figsize=(12, 4))\n",
+    "xs = np.arange(n)\n",
+    "ax.bar(xs, rf_subject_accs, color='steelblue', alpha=0.8)\n",
+    "ax.axhline(np.mean(rf_subject_accs), color='tomato', linestyle='--',\n",
+    "           label=f'Mean acc = {np.mean(rf_subject_accs)*100:.1f}%')\n",
+    "ax.set_xticks(xs); ax.set_xticklabels(SUBJECTS, rotation=45)\n",
+    "ax.set_ylabel('Accuracy'); ax.set_ylim(0, 1.05)\n",
+    "ax.set_title('Random Forest — Per-Subject LOSO Accuracy (3-class)')\n",
+    "ax.legend(); ax.grid(axis='y', alpha=0.3)\n",
+    "plt.tight_layout()\n",
+    "plt.savefig('per_subject_accuracy.png', dpi=150, bbox_inches='tight')\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Analysis & Discussion\n",
+    "\n",
+    "### Key Findings\n",
+    "\n",
+    "1. **Approach 1 (End-to-End CNN) vs. Approach 2 (Feature-Based)**\n",
+    "   - Approach 2 (feature-based): SVM and Random Forest operate on the 19 HRV features. They are interpretable and computationally lightweight.\n",
+    "   - Approach 1 (end-to-end): the Normal CNN learns its own representations directly from the 60s raw PPG window. It captures waveform morphology that hand-crafted features discard.\n",
+    "   - The **H-CNN** (Approach 1 extension) bridges both: it fuses CNN-learned features with the 19 hand-crafted features, achieving the best of both worlds.\n",
+    "\n",
+    "2. **H-CNN vs. Normal CNN**\n",
+    "   - The concatenation of the 19-feature vector (through a 4-unit dense branch) with the CNN's 8-dim global pooling embedding provides complementary information — the CNN captures temporal waveform structure while HRV features encode autonomic nervous system state.\n",
+    "   - The H-CNN paper reports ≈5% accuracy and ≈7% Macro F1 improvement over the Normal CNN on the 3-class problem.\n",
+    "\n",
+    "3. **Why 60s windows matter**\n",
+    "   - The LF band (0.04–0.15 Hz) has a period of 6.7–25 seconds. At the original 8s window, zero full LF cycles can be observed, making LF_power, rel_LF, LF_norm, and LF/HF meaningless. At 60s, at least 2 full cycles are captured.\n",
+    "   - This is confirmed by the original code's output showing `LF_power: 0.0000` for 8s windows.\n",
+    "\n",
+    "4. **Class difficulty (3-class)**\n",
+    "   - **Stress** is the easiest class — the Trier Social Stress Test (TSST) produces strong, consistent physiological responses (elevated HR, reduced HRV, high LF/HF).\n",
+    "   - **Amusement vs. Baseline** is hardest — the physiological signatures are subtle and overlapping.\n",
+    "\n",
+    "5. **Binary task (Stress vs. Non-stress)**\n",
+    "   - Collapsing Baseline and Amusement into a single Non-stress class simplifies the problem considerably. All models show substantially higher accuracy, consistent with published benchmarks.\n",
+    "\n",
+    "6. **Subject variability**\n",
+    "   - LOSO accuracy varies substantially across subjects — a known challenge in affective computing. Large inter-subject differences motivate personalisation approaches.\n",
+    "\n",
+    "### Limitations\n",
+    "- WESAD uses a controlled lab TSST stressor — results may not generalise to everyday stress\n",
+    "- Only 15 subjects limits statistical power; the dataset lacks age and gender diversity\n",
+    "- Class imbalance (Baseline >> Stress > Amusement) is partially addressed by inverse-frequency class weights\n",
+    "- TINN is approximated via histogram; a clinical-grade implementation requires formal triangular fitting"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbformat_minor": 4,
+   "pygments_lexer": "ipython3",
+   "version": "3.12.7"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 4
+}

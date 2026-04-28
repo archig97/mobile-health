@@ -32,7 +32,7 @@ from scipy.signal import butter, filtfilt
 # ─────────────────────────────────────────────
 # CONFIGURATION — edit these paths as needed
 # ─────────────────────────────────────────────
-DATA_ROOT  = "./data"       # root folder containing S2/, S3/, … S17/
+DATA_ROOT  = "./WESAD"          # root folder containing S2/, S3/, … S17/
 OUTPUT_DIR = "./processed"      # where .npy files and figures are saved
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
